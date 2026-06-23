@@ -1,5 +1,5 @@
 # ==============================================================================
-# [1] UPDATED REQUIREMENTS.TXT CONFIGURATION (Optimized for Render Python 3.14+)
+# [1] PRODUCTION REQUIREMENTS (Optimized for Render & Cloud Environments)
 # ==============================================================================
 # fastapi>=0.115.11
 # uvicorn==0.34.0
@@ -10,305 +10,408 @@
 import os
 import time
 import json
+import uuid
+import secrets
 import asyncio
 import httpx
-from typing import List, Dict
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from typing import List, Dict, Optional
+from fastapi import FastAPI, HTTPException, Request, Depends, status
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# --- TELEGRAM BOT INTEGRATION CORE ---
+# --- TELEGRAM BOT CORE ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 BOT_TOKEN = "7938490659:AAEdla7crncXJY0XDVWwUA8P8umOOdqHLC0"
-OWNER_ID = 7224513731  # Replace with your actual Telegram User ID
+OWNER_ID = 123456789  # Replace with your actual Telegram User ID
 
-# --- DB MANAGEMENT SYSTEM ---
-DB_FILE = "monitors_db.json"
-GLOBAL_SETTINGS_FILE = "global_settings.json"
-ADMIN_FILE = "admins.json"
+DB_FILE = "matrix_database.json"
 
-def load_json_file(filename, default_factory):
-    if os.path.exists(filename):
+# --- CORE CENTRAL DATABASE CONFIGURATION ---
+def load_db() -> Dict:
+    if os.path.exists(DB_FILE):
         try:
-            with open(filename, "r") as f:
+            with open(DB_FILE, "r") as f:
                 return json.load(f)
         except Exception:
-            return default_factory()
-    return default_factory()
+            pass
+    return {
+        "users": {},         # {user_id: {expiry: timestamp or "lifetime", link_limit: int, devices: [], banned: bool, web_session: str}}
+        "monitors": [],      # [{id, user_id, name, url, interval, status, is_active, ...}]
+        "redeem_codes": {},  # {code: {days: int, link_limit: int, max_devices: int, used: bool}}
+        "web_keys": []       # [keys...]
+    }
 
-def save_json_file(filename, data):
+def save_db(data: Dict):
     try:
-        with open(filename, "w") as f:
+        with open(DB_FILE, "w") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print(f"[!] Database Save Error ({filename}): {e}")
+        print(f"[!] DB Save Exception: {e}")
 
-# Global In-Memory Sync
-monitors: List[Dict] = load_json_file(DB_FILE, list)
-global_config = load_json_file(GLOBAL_SETTINGS_FILE, lambda: {"global_timeout": 12, "auto_refresh": True})
-admins: List[int] = load_json_file(ADMIN_FILE, list)
-total_global_checks = sum(m.get('total_checks', 0) for m in monitors)
-
+db = load_db()
 db_lock = asyncio.Lock()
 
-async def async_save_db():
+async def sync_db():
     async with db_lock:
-        save_json_file(DB_FILE, monitors)
+        save_db(db)
 
-class MonitorRequest(BaseModel):
-    name: str
-    url: str
-    interval: int = 5
-
-class SettingsRequest(BaseModel):
-    global_timeout: int
-    auto_refresh: bool
-
+# --- ENGINE BACKGROUND CHECKERS ---
 async_client_pool: httpx.AsyncClient = None
 
-async def check_api_status(monitor: Dict):
-    global total_global_checks
+async def check_target_pulse(monitor: Dict):
     start_time = time.time()
-    
     url = monitor['url']
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
-
-    timeout_val = float(global_config.get("global_timeout", 12))
-
     try:
-        response = await async_client_pool.get(url, timeout=timeout_val, follow_redirects=True)
-        response_time = int((time.time() - start_time) * 1000)
-        
+        response = await async_client_pool.get(url, timeout=12.0, follow_redirects=True)
+        monitor['response_time'] = int((time.time() - start_time) * 1000)
+        monitor['status_code'] = response.status_code
         if 200 <= response.status_code < 400:
             monitor['status'] = 'UP'
             monitor['success_checks'] += 1
         else:
             monitor['status'] = 'DOWN'
-        
-        monitor['response_time'] = response_time
-        monitor['status_code'] = response.status_code
-
     except Exception:
         monitor['status'] = 'DOWN'
         monitor['response_time'] = 0
         monitor['status_code'] = "ERR"
-        
     finally:
         monitor['total_checks'] += 1
-        total_global_checks += 1
         monitor['last_check'] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         if monitor['total_checks'] > 0:
             monitor['uptime'] = round((monitor['success_checks'] / monitor['total_checks']) * 100, 2)
-        await async_save_db()
 
-async def keep_alive_pulse():
-    await asyncio.sleep(30)
-    app_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("KOYEB_APP_URL") or "http://localhost:8080"
-    while True:
-        try:
-            await async_client_pool.get(app_url, timeout=10.0)
-        except Exception:
-            pass
-        await asyncio.sleep(300)
-
-async def monitor_loop():
+async def core_monitor_scheduler():
     while True:
         tasks = []
         current_time = time.time()
-        
-        for monitor in monitors:
-            if monitor.get('is_active', True):
-                last_run = monitor.get('_last_run_timestamp', 0)
-                interval_seconds = monitor.get('interval', 5) * 60
-                
+        for m in db["monitors"]:
+            # Check user license status prior to pinging
+            uid = str(m['user_id'])
+            user_info = db["users"].get(uid, {})
+            if user_info.get("banned", False):
+                m['is_active'] = False
+                m['status'] = 'SUSPENDED'
+                continue
+            
+            if user_info.get("expiry") != "lifetime" and user_info.get("expiry", 0) < current_time:
+                m['is_active'] = False
+                m['status'] = 'EXPIRED'
+                continue
+
+            if m.get('is_active', True):
+                last_run = m.get('_last_run_timestamp', 0)
+                interval_seconds = m.get('interval', 5) * 60
                 if current_time - last_run >= interval_seconds:
-                    monitor['_last_run_timestamp'] = current_time
-                    tasks.append(check_api_status(monitor))
-                    
+                    m['_last_run_timestamp'] = current_time
+                    tasks.append(check_target_pulse(m))
         if tasks:
             await asyncio.gather(*tasks)
-            await async_save_db()
-            
+            await sync_db()
         await asyncio.sleep(5)
 
-# --- TELEGRAM BOT HANDLERS ---
-def is_authorized(user_id: int) -> bool:
-    return user_id == OWNER_ID or user_id in admins
-
-async def bot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- TELEGRAM BOT ROUTING INTERFACE ---
+async def bot_start_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_authorized(user.id):
-        await update.message.reply_text("❌ Access Denied. Mainframe security lockdown active.")
-        return
+    uid_str = str(user.id)
+    current_time = time.time()
     
-    welcome_text = (
-        f"⚡ *VIP UPTIME MATRIX v6.0* ⚡\n\n"
-        f"🛡️ *Role:* {'Mainframe Owner' if user.id == OWNER_ID else 'Authorized Admin'}\n"
-        f"🤖 Welcome to the Control Node. Select an option below to manage operations."
+    # Check Ban Matrix
+    if db["users"].get(uid_str, {}).get("banned", False):
+        await update.message.reply_text("❌ Your mainframe identity profile has been BANNED by the Owner.")
+        return
+
+    # Owner Dashboard Route
+    if user.id == OWNER_ID:
+        msg = (
+            f"⚡ *VIP MASTER CONTROL PANEL* ⚡\n\n"
+            f"👑 *Role:* System Owner\n"
+            f"Use the buttons below or terminal commands to configure license allocation sequences."
+        )
+        keyboard = [
+            [InlineKeyboardButton("📊 System Global Statistics", callback_data="adm_stats")],
+            [InlineKeyboardButton("🖥️ Master Targets Grid", callback_data="adm_grid")],
+            [InlineKeyboardButton("🔑 Backup Database Dump", callback_data="adm_backup")]
+        ]
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Check Active Licensing
+    user_data = db["users"].get(uid_str)
+    if not user_data or (user_data["expiry"] != "lifetime" and user_data["expiry"] < current_time):
+        welcome_unauth = (
+            f"🛸 *VIP UPTIME MATRIX NETWORK* 🛸\n\n"
+            f"⚠️ *Access Refused:* Unauthorized Node ID: `{user.id}`\n"
+            f"You do not possess an active subscription key runtime.\n\n"
+            f"🛒 Contact the Administrator below to acquire a premium matrix license."
+        )
+        keyboard = [[InlineKeyboardButton("🛍️ BUY PREMIUM LICENSE", url="https://t.me/NIROB_BBZ")]]
+        await update.message.reply_text(welcome_unauth, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Standard Authenticated Client Route
+    exp_time = "LIFETIME REIGN" if user_data["expiry"] == "lifetime" else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_data["expiry"]))
+    client_msg = (
+        f"🛡️ *VIP CLIENT MAINFRAME NODE* 🛡️\n\n"
+        f"✅ *Status:* Authorized Premium\n"
+        f"📅 *Valid Till:* `{exp_time}`\n"
+        f"🚀 *Link Capacity Allocation:* `{len([m for m in db['monitors'] if m['user_id'] == user.id])}/{user_data['link_limit']}`"
     )
     keyboard = [
-        [InlineKeyboardButton("📊 Core Live Stats", callback_data="bot_stats")],
-        [InlineKeyboardButton("🖥️ Active Targets Grid", callback_data="bot_list")]
+        [InlineKeyboardButton("🖥️ Manage My Target Channels", callback_data="usr_grid")],
+        [InlineKeyboardButton("➕ Inject New Endpoint", callback_data="usr_add")]
     ]
-    await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(client_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def bot_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_authorized(query.from_user.id):
-        return
-
-    total = len(monitors)
-    up = len([m for m in monitors if m['is_active'] and m['status'] == 'UP'])
-    down = len([m for m in monitors if m['is_active'] and m['status'] == 'DOWN'])
+async def handle_redeem_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid_str = str(user.id)
+    text = update.message.text.strip()
     
-    stats_msg = (
-        f"📊 *SYSTEM CONTROL LOGS*\n\n"
-        f"🔹 Total Sequences: {total}\n"
-        f"🟢 Active Online (UP): {up}\n"
-        f"🔴 Offline/Error (DOWN): {down}\n"
-        f"⚡ Cumulative Pulses: {total_global_checks}"
-    )
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Mainframe", callback_data="bot_main")]]
-    await query.edit_message_text(stats_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def bot_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_authorized(query.from_user.id):
-        return
-
-    if not monitors:
-        msg = "⚠️ No target operational paths inside the database core."
-    else:
-        msg = "🖥️ *CURRENT TARGET MATRICES*:\n\n"
-        for m in monitors[:10]:
-            status_icon = "🟢" if m['status'] == 'UP' else "🔴" if m['status'] == 'DOWN' else "⚪"
-            msg += f"{status_icon} *{m['name']}* — {m['uptime']}% Health\n`{m['url']}`\n\n"
+    if text.startswith("nirobxuptime_"):
+        if db["users"].get(uid_str, {}).get("banned", False):
+            return
             
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Mainframe", callback_data="bot_main")]]
-    await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        code_data = db["redeem_codes"].get(text)
+        if not code_data or code_data.get("used", False):
+            await update.message.reply_text("❌ Transmission Error: Invalid or expired redeem token signature.")
+            return
+        
+        # Initialize or Update User Profile
+        days = code_data["days"]
+        expiry_val = "lifetime" if days == 0 else time.time() + (days * 86400)
+        
+        db["users"][uid_str] = {
+            "expiry": expiry_val,
+            "link_limit": code_data["link_limit"],
+            "max_devices": code_data["max_devices"],
+            "devices": [],
+            "banned": false
+        }
+        code_data["used"] = True
+        await sync_db()
+        
+        await update.message.reply_text(
+            f"🧬 *MATRIX LICENSE ACTIVATED* 🧬\n\n"
+            f"🔑 Token Verified Successfully.\n"
+            f"📊 Link Max Capacity: {code_data['link_limit']}\n"
+            f"⏳ Access Duration: {'LIFETIME' if days == 0 else f'{days} Days'}\n\n"
+            f"Run /start to launch your control matrix interface.", parse_mode="Markdown"
+        )
 
-async def bot_main_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- BOT EXCLUSIVE COMMAND LAYER FOR OWNER ---
+async def cmd_generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        # Syntax: /genkey <days> <links> <devices> (0 days means Lifetime)
+        days = int(context.args[0])
+        links = int(context.args[1])
+        devices = int(context.args[2])
+        
+        token = f"nirobxuptime_{secrets.token_hex(4)}"
+        db["redeem_codes"][token] = {
+            "days": days,
+            "link_limit": links,
+            "max_devices": devices,
+            "used": False
+        }
+        await sync_db()
+        
+        duration = "LIFETIME" if days == 0 else f"{days} Days"
+        await update.message.reply_text(
+            f"🎫 *VIP LICENSE TOKEN GENERATED* 🎫\n\n"
+            f"`{token}`\n\n"
+            f"⚙️ Config: {duration} | {links} Max Links | {devices} Devices Limit\n"
+            f"Send this payload string to the intended sub-admin recipient.", parse_mode="Markdown"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Owner Format: `/genkey <days_count> <links_limit> <devices_limit>` (Pass 0 days for Lifetime)")
+
+async def cmd_ban_infrastructure(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        target_uid = str(context.args[0])
+        if target_uid not in db["users"]: db["users"][target_uid] = {}
+        db["users"][target_uid]["banned"] = True
+        await sync_db()
+        await update.message.reply_text(f"⚔️ Mainframe Identity {target_uid} isolated and BANNED.")
+    except IndexError:
+        await update.message.reply_text("Usage: `/ban <USER_ID>`")
+
+async def cmd_unban_infrastructure(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        target_uid = str(context.args[0])
+        if target_uid in db["users"]:
+            db["users"][target_uid]["banned"] = False
+            await sync_db()
+            await update.message.reply_text(f"🧬 Mainframe Isolation Revoked for ID {target_uid}.")
+    except IndexError:
+        await update.message.reply_text("Usage: `/unban <USER_ID>`")
+
+async def cmd_modify_link_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        target_uid = str(context.args[0])
+        new_lim = int(context.args[1])
+        if target_uid in db["users"]:
+            db["users"][target_uid]["link_limit"] = new_lim
+            await sync_db()
+            await update.message.reply_text(f"🛡️ Target {target_uid} updated with custom max link restriction: {new_lim}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: `/setlimit <USER_ID> <new_limit>`")
+
+async def cmd_generate_webkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    wkey = f"matrix_key_{secrets.token_urlsafe(16)}"
+    db["web_keys"].append(wkey)
+    await sync_db()
+    await update.message.reply_text(f"🔑 *WEB DASHBOARD GATEWAY ACCESS KEY*\n\n`{wkey}`\n\nUse this authentication signature string to pass the web portal perimeter protection system.", parse_mode="Markdown")
+
+async def cmd_backup_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    await sync_db()
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, 'rb') as doc:
+            await update.message.reply_document(document=doc, filename="matrix_database_backup.json", caption="⚡ Live Matrix Database Vector Stream Dump Complete.")
+
+# --- TELEGRAM INLINE CALLBACK PROCESSING ROUTINES ---
+async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    keyboard = [
-        [InlineKeyboardButton("📊 Core Live Stats", callback_data="bot_stats")],
-        [InlineKeyboardButton("🖥️ Active Targets Grid", callback_data="bot_list")]
-    ]
-    await query.edit_message_text("⚡ *VIP UPTIME MATRIX v6.0*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    uid = query.from_user.id
+    uid_str = str(uid)
+    data = query.data
 
-async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Security Override: Only the Owner can authorize new nodes.")
+    # OWNER CALLBACK MATCHERS
+    if uid == OWNER_ID:
+        if data == "adm_stats":
+            total_users = len(db["users"])
+            total_links = len(db["monitors"])
+            up_links = len([m for m in db["monitors"] if m["status"] == "UP"])
+            msg = f"📊 *GLOBAL ADMINISTRATIVE METRICS*\n\n🔹 Total Systems Profiles: {total_users}\n🔹 Registered Targets: {total_links}\n🟢 Synchronized Secure Nodes: {up_links}"
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return Dashboard", callback_data="adm_home")]]))
+        elif data == "adm_grid":
+            msg = "🖥️ *GLOBAL TARGET ALLOCATION NETWORKS*:\n\n"
+            for m in db["monitors"][:15]:
+                status_ico = "🟢" if m["status"] == "UP" else "🔴" if m["status"] == "DOWN" else "⚪"
+                msg += f"{status_ico} ID:`{m['id']}` | User:`{m['user_id']}`\n📌 Name: *{m['name']}*\n🌐 `{m['url']}`\n\n"
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return Dashboard", callback_data="adm_home")]]))
+        elif data == "adm_home":
+            msg = "⚡ *VIP MASTER CONTROL PANEL* ⚡"
+            keyboard = [
+                [InlineKeyboardButton("📊 System Global Statistics", callback_data="adm_stats")],
+                [InlineKeyboardButton("🖥️ Master Targets Grid", callback_data="adm_grid")]
+            ]
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    try:
-        new_admin_id = int(context.args[0])
-        if new_admin_id not in admins:
-            admins.append(new_admin_id)
-            save_json_file(ADMIN_FILE, admins)
-            await update.message.reply_text(f"🧬 Access Granted: User ID {new_admin_id} is registered as Admin.")
+
+    # USER INLINE WORKFLOWS
+    user_conf = db["users"].get(uid_str)
+    if not user_conf or user_conf.get("banned", False): return
+
+    if data == "usr_grid":
+        my_nodes = [m for m in db["monitors"] if m["user_id"] == uid]
+        if not my_nodes:
+            msg = "⚠️ Your sub-allocation profile contains no active network traces inside the database core."
         else:
-            await update.message.reply_text("User is already authorized.")
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Syntax: `/addadmin <USER_ID>`")
+            msg = "🖥️ *YOUR OPERATIONAL CHANNELS*:\n\n"
+            for m in my_nodes:
+                status_ico = "🟢" if m["status"] == "UP" else "🔴" if m["status"] == "DOWN" else "⚪"
+                msg += f"{status_ico} *{m['name']}* ({m['uptime']}% Health)\n`{m['url']}`\n⚙️ Active Status: {m['is_active']}\n\n"
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="usr_home")]]))
+    elif data == "usr_home":
+        client_msg = f"🛡️ *VIP CLIENT MAINFRAME NODE* 🛡️\n\n🚀 Resource Utilization Matrix Panel Loading..."
+        keyboard = [
+            [InlineKeyboardButton("🖥️ Manage My Target Channels", callback_data="usr_grid")]
+        ]
+        await query.edit_message_text(client_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def del_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Security Override: Only the Owner can strip admin credentials.")
-        return
-    try:
-        admin_id = int(context.args[0])
-        if admin_id in admins:
-            admins.remove(admin_id)
-            save_json_file(ADMIN_FILE, admins)
-            await update.message.reply_text(f"⚔️ Access Revoked: User ID {admin_id} wiped from registry.")
-        else:
-            await update.message.reply_text("User ID not found in Admin database.")
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Syntax: `/deladmin <USER_ID>`")
-
-async def direct_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    total = len(monitors)
-    up = len([m for m in monitors if m['is_active'] and m['status'] == 'UP'])
-    await update.message.reply_text(f"⚡ Grid Status: {up}/{total} Nodes Operational.")
-
-# --- LIFESPAN AND API CONFIGURATION ---
+# --- FASTAPI WEB LIFECYCLE MANAGEMENT ---
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def app_lifespan(app: FastAPI):
     global async_client_pool
-    async_client_pool = httpx.AsyncClient(limits=httpx.Limits(max_connections=100, max_keepalive_connections=20))
+    async_client_pool = httpx.AsyncClient(limits=httpx.Limits(max_connections=200, max_keepalive_connections=50))
     
+    # Initialize Application Bot Orchestration Layer
     bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", bot_start))
-    bot_app.add_handler(CommandHandler("addadmin", add_admin))
-    bot_app.add_handler(CommandHandler("deladmin", del_admin))
-    bot_app.add_handler(CommandHandler("stats", direct_stats_cmd))
-    bot_app.add_handler(CallbackQueryHandler(bot_stats_callback, pattern="bot_stats"))
-    bot_app.add_handler(CallbackQueryHandler(bot_list_callback, pattern="bot_list"))
-    bot_app.add_handler(CallbackQueryHandler(bot_main_callback, pattern="bot_main"))
+    bot_app.add_handler(CommandHandler("start", bot_start_router))
+    bot_app.add_handler(CommandHandler("genkey", cmd_generate_token))
+    bot_app.add_handler(CommandHandler("ban", cmd_ban_infrastructure))
+    bot_app.add_handler(CommandHandler("unban", cmd_unban_infrastructure))
+    bot_app.add_handler(CommandHandler("setlimit", cmd_modify_link_limit))
+    bot_app.add_handler(CommandHandler("webkey", cmd_generate_webkey))
+    bot_app.add_handler(CommandHandler("backup", cmd_backup_json))
+    bot_app.add_handler(CallbackQueryHandler(bot_callback_handler))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redeem_attempt))
     
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
     
-    asyncio.create_task(monitor_loop())
-    asyncio.create_task(keep_alive_pulse())
-    
+    asyncio.create_task(core_monitor_scheduler())
     yield
     await bot_app.updater.stop()
     await bot_app.stop()
     await bot_app.shutdown()
     await async_client_pool.aclose()
 
-app = FastAPI(title="VIP Uptime Monitor By SPEED_X", lifespan=lifespan)
+app = FastAPI(title="VIP Central Matrix System By SPEED_X", lifespan=app_lifespan)
 
-# --- API ENDPOINTS ---
-@app.get("/api/stats")
-async def get_stats():
-    total = len(monitors)
-    active = len([m for m in monitors if m['is_active']])
-    up = len([m for m in monitors if m['is_active'] and m['status'] == 'UP'])
-    down = len([m for m in monitors if m['is_active'] and m['status'] == 'DOWN'])
-    return {
-        "total": total,
-        "active": active,
-        "up": up,
-        "down": down,
-        "total_checks": total_global_checks,
-        "settings": global_config
-    }
+# --- BACKEND REST API ENDPOINTS CONTROLLERS ---
+@app.post("/api/auth/verify")
+async def verify_web_key(payload: Dict):
+    key = payload.get("key")
+    device_id = payload.get("device_id", "web_node")
+    if not key: raise HTTPException(status_code=400, detail="Missing Authentication Matrix Key")
+    
+    # Owner Authorization Check
+    if key in db["web_keys"]:
+        return {"status": "authorized", "role": "owner", "token": key, "user_id": OWNER_ID}
+    
+    # Check if Key matches user subscription session token
+    for uid_str, udata in db["users"].items():
+        if udata.get("banned", False): continue
+        # For simplicity, let sub-admins present their Active Redeem Code as Web Key 
+        if key in db["redeem_codes"]:
+            if device_id not in udata["devices"]:
+                if len(udata["devices"]) >= udata["max_devices"]:
+                    raise HTTPException(status_code=403, detail="Device Registration Matrix Denied: Hard Hardware Ceiling Hit.")
+                udata["devices"].append(device_id)
+                await sync_db()
+            return {"status": "authorized", "role": "subadmin", "token": key, "user_id": int(uid_str)}
+            
+    raise HTTPException(status_code=401, detail="Cryptographic Security Check Failure: Unauthorized Key Pattern.")
 
 @app.get("/api/monitors")
-async def get_monitors():
-    cleaned_monitors = []
-    for m in monitors:
-        copy_m = m.copy()
-        copy_m.pop('_last_run_timestamp', None)
-        cleaned_monitors.append(copy_m)
-    return cleaned_monitors
-
-@app.post("/api/settings")
-async def update_settings(req: SettingsRequest):
-    global global_config
-    global_config["global_timeout"] = req.global_timeout
-    global_config["auto_refresh"] = req.auto_refresh
-    save_json_file(GLOBAL_SETTINGS_FILE, global_config)
-    return {"success": True, "settings": global_config}
+async def fetch_api_monitors(user_id: int, role: str):
+    if role == "owner":
+        return db["monitors"]
+    return [m for m in db["monitors"] if m["user_id"] == user_id]
 
 @app.post("/api/monitors")
-async def add_monitor(req: MonitorRequest):
-    new_monitor = {
+async def create_api_monitor(payload: Dict):
+    uid_str = str(payload["user_id"])
+    role = payload["role"]
+    user_info = db["users"].get(uid_str)
+    
+    if role != "owner":
+        if not user_info or user_info.get("banned", False):
+            raise HTTPException(status_code=403, detail="Account suspension matrix active.")
+        existing_count = len([m for m in db["monitors"] if m["user_id"] == int(payload["user_id"])])
+        if existing_count >= user_info["link_limit"]:
+            raise HTTPException(status_code=400, detail="Target tracking quantitative limit ceiling breached.")
+
+    new_node = {
         "id": str(int(time.time() * 1000)),
-        "name": req.name,
-        "url": req.url,
-        "interval": req.interval,
+        "user_id": int(payload["user_id"]),
+        "name": payload["name"],
+        "url": payload["url"],
+        "interval": int(payload["interval"]),
         "status": "PENDING",
         "response_time": 0,
         "status_code": "N/A",
@@ -316,553 +419,298 @@ async def add_monitor(req: MonitorRequest):
         "success_checks": 0,
         "total_checks": 0,
         "is_active": True,
-        "last_check": "Never",
         "_last_run_timestamp": 0
     }
-    monitors.append(new_monitor)
-    await check_api_status(new_monitor) 
-    await async_save_db()
-    return new_monitor
+    db["monitors"].append(new_node)
+    await sync_db()
+    return new_node
 
-@app.post("/api/monitors/{monitor_id}/ping")
-async def force_ping_monitor(monitor_id: str):
-    for m in monitors:
-        if m['id'] == monitor_id:
-            if not m['is_active']:
-                raise HTTPException(status_code=400, detail="Cannot pulse suspended node")
-            await check_api_status(m)
-            await async_save_db()
+@app.post("/api/monitors/{mid}/toggle")
+async def toggle_api_monitor(mid: str, payload: Dict):
+    uid = int(payload["user_id"])
+    role = payload["role"]
+    for m in db["monitors"]:
+        if m["id"] == mid:
+            if role != "owner" and m["user_id"] != uid:
+                raise HTTPException(status_code=403, detail="Security Intercept: Privilege Violation")
+            m["is_active"] = not m["is_active"]
+            m["status"] = "PENDING" if m["is_active"] else "STOPPED"
+            await sync_db()
             return m
-    raise HTTPException(status_code=404, detail="Monitor not found")
+    raise HTTPException(status_code=404, detail="Node missing")
 
-@app.post("/api/monitors/{monitor_id}/toggle")
-async def toggle_monitor(monitor_id: str):
-    for m in monitors:
-        if m['id'] == monitor_id:
-            m['is_active'] = not m['is_active']
-            m['status'] = 'PENDING' if m['is_active'] else 'STOPPED'
-            if m['is_active']:
-                m['_last_run_timestamp'] = 0
-            await async_save_db()
-            return m
-    raise HTTPException(status_code=404, detail="Monitor not found")
-
-@app.post("/api/global/suspend")
-async def suspend_all_monitors():
-    for m in monitors:
-        m['is_active'] = False
-        m['status'] = 'STOPPED'
-    await async_save_db()
+@app.delete("/api/monitors/{mid}")
+async def delete_api_monitor(mid: str, user_id: int, role: str):
+    global db
+    initial_len = len(db["monitors"])
+    if role == "owner":
+        db["monitors"] = [m for m in db["monitors"] if m["id"] != mid]
+    else:
+        db["monitors"] = [m for m in db["monitors"] if not (m["id"] == mid and m["user_id"] == user_id)]
+    if len(db["monitors"]) == initial_len:
+        raise HTTPException(status_code=404, detail="Target not modified")
+    await sync_db()
     return {"success": True}
 
-@app.post("/api/global/resume")
-async def resume_all_monitors():
-    for m in monitors:
-        m['is_active'] = True
-        m['status'] = 'PENDING'
-        m['_last_run_timestamp'] = 0
-    await async_save_db()
-    return {"success": True}
+# --- MASTER DATABASE RE-UPLOAD SYSTEM MANAGEMENT ENDPOINTS ---
+@app.post("/api/system/upload_db")
+async def system_replace_db(payload: Dict):
+    global db
+    if payload.get("role") != "owner": raise HTTPException(status_code=403, detail="Access Denied")
+    incoming_data = payload.get("database_json")
+    if not incoming_data or "users" not in incoming_data or "monitors" not in incoming_data:
+        raise HTTPException(status_code=400, detail="Malformed structure schematic architecture framework.")
+    db = incoming_data
+    await sync_db()
+    return {"success": True, "detail": "Core Database structures overwritten successfully matching standard payload schema."}
 
-@app.post("/api/global/purge")
-async def purge_all_monitors():
-    global monitors
-    monitors.clear()
-    await async_save_db()
-    return {"success": True}
-
-@app.delete("/api/monitors/{monitor_id}")
-async def delete_monitor(monitor_id: str):
-    global monitors
-    monitors = [m for m in monitors if m['id'] != monitor_id]
-    await async_save_db()
-    return {"success": True}
-
-
-# --- NEW INSANELY PREMIUM CYBERPUNK VIP WEB INTERFACE (v6.0) ---
-
+# --- FULL NEXT-GEN REDESIGNED VIP MATRICES WEB FRONTEND APPLICATION LAYER ---
 @app.get("/", response_class=HTMLResponse)
-async def serve_ui():
-    html_content = """
+async def deliver_nextgen_ui():
+    return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>SPEED_X • VIP MATRIX INTERFACE</title>
+        <title>SPEED_X • NEXTGEN SECURITY GRID</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <script src="https://cdn.jsdelivr.net/npm/particles.js@2.0.0/particles.min.js"></script>
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Share+Tech+Mono&display=swap');
-            
-            body { 
-                background-color: #030307; 
-                color: #e2e8f0; 
-                font-family: 'Share Tech Mono', monospace; 
-                overflow-x: hidden; 
-                user-select: none;
-            }
-            .font-orbitron { font-family: 'Orbitron', sans-serif; }
-            
-            /* High-End Cyberpunk Neon Shadows & Text Glows */
-            .cyber-glow-cyan { box-shadow: 0 0 30px rgba(6, 182, 212, 0.2); border: 1px solid rgba(6, 182, 212, 0.4) !important; }
-            .cyber-glow-purple { box-shadow: 0 0 30px rgba(168, 85, 247, 0.2); border: 1px solid rgba(168, 85, 247, 0.4) !important; }
-            
-            .text-neon-cyan { text-shadow: 0 0 10px rgba(6, 182, 212, 0.7), 0 0 20px rgba(6, 182, 212, 0.3); }
-            .text-neon-purple { text-shadow: 0 0 10px rgba(168, 85, 247, 0.7), 0 0 20px rgba(168, 85, 247, 0.3); }
-            .text-neon-emerald { text-shadow: 0 0 8px rgba(16, 185, 129, 0.6); }
-            
-            /* Premium Futuristic Cards */
-            .matrix-panel {
-                background: linear-gradient(145deg, rgba(10, 10, 22, 0.85) 0%, rgba(5, 5, 12, 0.95) 100%);
-                border: 1px solid rgba(6, 182, 212, 0.1);
-                backdrop-filter: blur(20px);
-                position: relative;
-                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            }
-            .matrix-panel:hover {
-                border-color: rgba(168, 85, 247, 0.4);
-                box-shadow: 0 0 30px rgba(168, 85, 247, 0.15);
-                transform: translateY(-2px);
-            }
-            
-            /* Background Grid Overlay */
-            .bg-matrix-grid {
-                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                background-image: linear-gradient(rgba(6, 182, 212, 0.02) 1px, transparent 1px),
-                                  linear-gradient(90deg, rgba(6, 182, 212, 0.02) 1px, transparent 1px);
-                background-size: 30px 30px; z-index: -1; pointer-events: none;
-            }
-            
-            #particles-js { position: fixed; width: 100%; height: 100%; z-index: -2; top: 0; left: 0; }
-            
-            /* Custom Cyber Scanner Animation */
-            .scanner-line {
-                height: 1px; background: linear-gradient(90deg, transparent, #a855f7, transparent);
-                width: 100%; position: absolute; left: 0; animation: scanning 6s linear infinite; pointer-events: none;
-            }
-            @keyframes scanning { 0% { top: 0%; opacity: 0; } 10% { opacity: 1; } 90% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
-            
-            #toast-container { position: fixed; bottom: 25px; right: 25px; z-index: 100; display: flex; flex-direction: column; gap: 12px; }
-            
-            /* Interactive Buttons Styling */
-            .cyber-btn {
-                position: relative; overflow: hidden; transition: all 0.2s ease;
-                border: 1px solid rgba(6, 182, 212, 0.3); background: rgba(6, 182, 212, 0.05);
-            }
-            .cyber-btn:hover {
-                background: rgba(6, 182, 212, 0.2); border-color: #06b6d4;
-                color: #fff; box-shadow: 0 0 15px rgba(6, 182, 212, 0.4);
-            }
-            .cyber-btn-purple {
-                border: 1px solid rgba(168, 85, 247, 0.3); background: rgba(168, 85, 247, 0.05);
-            }
-            .cyber-btn-purple:hover {
-                background: rgba(168, 85, 247, 0.2); border-color: #a855f7;
-                box-shadow: 0 0 15px rgba(168, 85, 247, 0.4);
-            }
-            
-            .terminal-view {
-                background: rgba(2, 2, 6, 0.9); border: 1px solid rgba(168, 85, 247, 0.15);
-                box-shadow: inset 0 0 20px rgba(0,0,0,0.9); height: 150px; overflow-y: auto;
-            }
+            @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600;900&family=Share+Tech+Mono&display=swap');
+            body { background: #020204; color: #cbd5e1; font-family: 'Share Tech Mono', monospace; user-select: none; }
+            .font-vip { font-family: 'Orbitron', sans-serif; }
+            .vip-panel { background: rgba(6, 6, 14, 0.95); border: 1px solid rgba(147, 51, 234, 0.15); box-shadow: 0 0 40px rgba(0,0,0,0.8); }
+            .vip-glow-glow { box-shadow: 0 0 25px rgba(147, 51, 234, 0.25); border-color: rgba(147, 51, 234, 0.5) !important; }
+            .text-vip-neon { text-shadow: 0 0 12px rgba(192, 132, 252, 0.8); }
+            .crypto-input { background: rgba(0, 0, 0, 0.8); border: 1px solid rgba(147, 51, 234, 0.3); color: #fff; }
+            .crypto-input:focus { border-color: #a855f7; box-shadow: 0 0 15px rgba(147, 51, 234, 0.4); outline: none; }
         </style>
-        
-        <!-- HIGH-SECURE ENCRYPTED ANTI-EXPLOIT SYSTEM LAYER -->
         <script>
             document.addEventListener('contextmenu', e => e.preventDefault());
-            document.onkeydown = function(e) {
-                if (e.keyCode == 123) return false;
-                if (e.ctrlKey && e.shiftKey && e.keyCode == 'I'.charCodeAt(0)) return false;
-                if (e.ctrlKey && e.shiftKey && e.keyCode == 'C'.charCodeAt(0)) return false;
-                if (e.ctrlKey && e.shiftKey && e.keyCode == 'J'.charCodeAt(0)) return false;
-                if (e.ctrlKey && e.keyCode == 'U'.charCodeAt(0)) return false;
-            };
-            setInterval(function() {
-                const start = +new Date(); debugger;
-                if ((+new Date() - start) > 100) {
-                    document.body.innerHTML = "<div class='flex justify-center items-center h-screen bg-black text-purple-500 font-mono text-xl tracking-widest'>[DEFENSE LAYER INTERCEPTED: EXPLOIT BLOCKED]</div>";
-                }
-            }, 50);
+            // Hardware fingerprints mapping strategy
+            function fetchHardwareNodeSignature() {
+                let sig = localStorage.getItem('matrix_hardware_signature');
+                if(!sig) { sig = 'node_hw_' + Math.random().toString(36).substring(2, 15); localStorage.setItem('matrix_hardware_signature', sig); }
+                return sig;
+            }
         </script>
     </head>
-    <body class="relative min-h-screen">
-        <div id="particles-js"></div>
-        <div class="bg-matrix-grid"></div>
-        <div id="toast-container"></div>
-
-        <div class="max-w-6xl mx-auto px-4 py-6 relative z-10">
-            <!-- Global Utility Command Bar -->
-            <div class="flex flex-wrap justify-between items-center gap-4 mb-8 bg-black/60 border border-purple-950/40 px-5 py-3 rounded-xl backdrop-blur-md">
-                <div class="flex items-center gap-3">
-                    <button onclick="toggleAudio()" id="audio-btn" class="px-4 py-1.5 cyber-btn text-cyan-400 text-xs font-bold rounded-lg flex items-center gap-2">
-                        <i class="fa-solid fa-volume-high" id="audio-icon"></i> SFX: ACTIVE
-                    </button>
-                    <span id="auto-refresh-badge" class="px-3 py-1.5 bg-purple-950/30 border border-purple-900/40 text-purple-400 font-bold text-xs rounded-lg">SYNC RUNTIME: ON</span>
+    <body class="min-h-screen relative p-4 flex items-center justify-center">
+        <!-- AUTH GATEWAY PROTECTION INTERFACE CONSOLE -->
+        <div id="auth-wall-container" class="w-full max-w-md vip-panel p-8 rounded-2xl border-t-4 border-t-purple-600 z-50 relative">
+            <div class="text-center mb-6">
+                <div class="inline-block p-3 bg-purple-950/40 rounded-full mb-3 border border-purple-500/30">
+                    <i class="fa-solid fa-user-shield text-3xl text-purple-400"></i>
                 </div>
-                <div class="flex flex-wrap gap-2">
-                    <button onclick="globalAction('resume')" class="px-3 py-1.5 bg-emerald-950/30 border border-emerald-900/40 hover:border-emerald-500 text-emerald-400 font-bold text-xs rounded-lg transition-all"><i class="fa-solid fa-play mr-1"></i> RESUME MATRIX</button>
-                    <button onclick="globalAction('suspend')" class="px-3 py-1.5 bg-amber-950/30 border border-amber-900/40 hover:border-amber-500 text-amber-400 font-bold text-xs rounded-lg transition-all"><i class="fa-solid fa-pause mr-1"></i> PAUSE ALL</button>
-                    <button onclick="globalPurge()" class="px-3 py-1.5 bg-rose-950/30 border border-rose-900/40 hover:border-rose-500 text-rose-400 font-bold text-xs rounded-lg transition-all"><i class="fa-solid fa-radiation mr-1"></i> PURGE CORE</button>
-                </div>
+                <h1 class="text-2xl font-black tracking-widest font-vip text-white text-vip-neon">SECURITY CHECKPOINT</h1>
+                <p class="text-[11px] text-gray-500 uppercase tracking-widest mt-1">OPERATOR ENCRYPTED GATEWAY SIGNATURE PERIMETER</p>
             </div>
-
-            <!-- Header Branding Vector Layout -->
-            <header class="text-center mb-10 relative">
-                <div class="inline-block px-4 py-1.5 bg-gradient-to-r from-purple-950/50 to-cyan-950/50 border border-purple-500/30 text-purple-400 text-xs tracking-widest uppercase rounded-lg mb-3">
-                    <i class="fa-solid fa-shield-halved animate-pulse mr-2 text-cyan-400"></i> SECURITY LOGISTICS SYSTEM ACTIVE
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold text-purple-400 uppercase mb-1">Enter Master Key or Token Profile</label>
+                    <input type="password" id="gateway-security-key" class="w-full crypto-input rounded-xl px-4 py-3 text-xs tracking-widest text-center" placeholder="matrix_key_... or nirobxuptime_...">
                 </div>
-                <h1 class="text-4xl md:text-6xl font-black tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-purple-400 to-indigo-500 font-orbitron text-neon-cyan">VIP UPTIME MATRIX</h1>
-                <p class="text-xs text-gray-500 tracking-widest mt-2 uppercase font-mono">POWERED BY <span class="text-purple-400 font-bold text-neon-purple">SPEED_X</span> • SECURED ENGINE v6.0</p>
+                <button onclick="attemptPerimeterAuthentication()" class="w-full bg-purple-600 hover:bg-purple-500 text-black font-black py-3 rounded-xl tracking-widest uppercase text-xs font-vip transition-all shadow-lg">VERIFY SCHEMATIC IDENTITY</button>
+            </div>
+        </div>
+
+        <!-- PRINCIPAL WORKSPACE LOGISTICS MATRIX LAYOUT CONTAINER -->
+        <div id="mainframe-application-workspace" class="w-full max-w-6xl mx-auto space-y-6 hidden my-6">
+            <header class="vip-panel p-6 rounded-2xl flex flex-col md:flex-row justify-between items-center gap-4 border-l-4 border-l-purple-500">
+                <div>
+                    <h1 class="text-3xl font-black font-vip text-white tracking-widest text-vip-neon">VIP INTEGRATED SECURITY MATRIX</h1>
+                    <p class="text-xs text-gray-500 tracking-wider">SECURED CONTROLS ARCHITECTURE • POWERED BY SPEED_X</p>
+                </div>
+                <div class="flex items-center gap-3">
+                    <span id="role-badge" class="px-4 py-1.5 bg-purple-950/40 border border-purple-500/40 text-purple-300 font-black text-xs uppercase tracking-widest rounded-lg">SUBADMIN CONSOLE ACTIVE</span>
+                    <button onclick="destroyLocalSession()" class="px-3 py-1.5 bg-rose-950/40 border border-rose-900/50 hover:border-rose-500 text-rose-400 font-bold text-xs rounded-lg transition-all">TERMINATE ACCESS</button>
+                </div>
             </header>
 
-            <!-- Metrics Core Status Dashboard -->
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
-                <div class="matrix-panel p-5 rounded-xl text-center border-b-2 border-cyan-500 overflow-hidden">
-                    <div class="scanner-line opacity-20"></div>
-                    <h3 class="text-xs text-cyan-400/70 uppercase tracking-wider mb-1 font-bold">Total Signals</h3>
-                    <p id="stat-total" class="text-4xl font-black text-cyan-400 tracking-tighter">0</p>
-                </div>
-                <div class="matrix-panel p-5 rounded-xl text-center border-b-2 border-purple-500">
-                    <h3 class="text-xs text-purple-400/70 uppercase tracking-wider mb-1 font-bold">Active Tracks</h3>
-                    <p id="stat-active" class="text-4xl font-black text-purple-400 tracking-tighter">0</p>
-                </div>
-                <div class="matrix-panel p-5 rounded-xl text-center border-b-2 border-emerald-500">
-                    <h3 class="text-xs text-emerald-400/70 uppercase tracking-wider mb-1 font-bold">Grid Secure (UP)</h3>
-                    <p id="stat-up" class="text-4xl font-black text-emerald-400 tracking-tighter text-neon-emerald">0</p>
-                </div>
-                <div class="matrix-panel p-5 rounded-xl text-center border-b-2 border-rose-500">
-                    <h3 class="text-xs text-rose-400/70 uppercase tracking-wider mb-1 font-bold">Breached (DOWN)</h3>
-                    <p id="stat-down" class="text-4xl font-black text-rose-400 tracking-tighter text-shadow">0</p>
-                </div>
-                <div class="matrix-panel p-5 rounded-xl text-center border-b-2 border-amber-500 col-span-2 md:col-span-1">
-                    <h3 class="text-xs text-amber-400/70 uppercase tracking-wider mb-1 font-bold">Total Pings</h3>
-                    <p id="stat-checks" class="text-4xl font-black text-amber-400 tracking-tighter">0</p>
+            <!-- OWNER PANELS STORAGE CONFIG BOX EXTENSIONS -->
+            <div id="owner-exclusive-operations-box" class="hidden vip-panel p-6 rounded-2xl border border-dashed border-purple-500/40 space-y-4">
+                <h2 class="text-xs font-bold text-purple-400 font-vip uppercase tracking-widest"><i class="fa-solid fa-triangle-exclamation mr-1.5"></i> Live Core Infrastructure Maintenance Console Engine</h2>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="bg-black/40 border border-purple-950 p-4 rounded-xl">
+                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Overwrite/Restore Remote Active JSON Database Structure</h3>
+                        <input type="file" id="db-file-picker" accept=".json" class="block w-full text-xs text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-purple-950 file:text-purple-400 cursor-pointer">
+                        <button onclick="commitDatabaseOverrideUpload()" class="mt-3 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-black text-xs font-black rounded-lg uppercase tracking-wider transition-all">EXECUTE FULL SYNC HOT-REPLACE</button>
+                    </div>
+                    <div class="bg-black/40 border border-purple-950 p-4 rounded-xl flex flex-col justify-between">
+                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Dump/Extract Remote Database Matrix Snapshot</h3>
+                        <p class="text-[11px] text-gray-500">Extract an instantaneous exact state cryptographic configuration of all active nodes, monitors, profiles, and tickets inside the mainframe database storage layer.</p>
+                        <button onclick="triggerDatabaseExportDownload()" class="mt-2 px-4 py-2 border border-purple-500 text-purple-400 hover:bg-purple-950 text-xs font-bold rounded-lg uppercase tracking-wider transition-all">EXTRACT SNAPSHOT BACKUP</button>
+                    </div>
                 </div>
             </div>
 
-            <!-- Double Workspace Columns -->
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
-                <!-- Endpoint Insertion Control Box -->
-                <div class="matrix-panel p-6 rounded-2xl lg:col-span-2 border border-purple-500/10 shadow-2xl">
-                    <h2 class="text-sm font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-400 mb-6 flex items-center gap-2 uppercase tracking-widest font-orbitron">
-                        <i class="fa-solid fa-bolt text-cyan-400"></i> INJECT MONITOR NETWORK TARGET
-                    </h2>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-5">
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- Injection Panel Card -->
+                <div class="vip-panel p-6 rounded-2xl space-y-4 h-fit">
+                    <h2 class="text-xs font-bold text-white font-vip uppercase tracking-widest flex items-center gap-1.5 text-vip-neon"><i class="fa-solid fa-circle-plus text-purple-400"></i> Inject Operational Vector Target</h2>
+                    <div class="space-y-3 text-xs">
                         <div>
-                            <label class="block text-xs font-bold text-cyan-400/80 mb-1.5 uppercase tracking-wide">Target Descriptor / Alias</label>
-                            <div class="relative">
-                                <i class="fa-solid fa-signature absolute left-3.5 top-3.5 text-purple-500/40 text-xs"></i>
-                                <input type="text" id="mon-name" placeholder="e.g. VIP API Mainframe" class="w-full bg-black/60 border border-purple-950 rounded-lg pl-10 pr-4 py-2.5 text-white placeholder-gray-700 focus:outline-none focus:border-cyan-500 text-xs">
-                            </div>
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Alias / Name</label>
+                            <input type="text" id="target-name" class="w-full crypto-input rounded-lg p-2.5" placeholder="VIP Target API Host">
                         </div>
                         <div>
-                            <label class="block text-xs font-bold text-cyan-400/80 mb-1.5 uppercase tracking-wide">Routing Endpoint URL</label>
-                            <div class="relative">
-                                <i class="fa-solid fa-link absolute left-3.5 top-3.5 text-purple-500/40 text-xs"></i>
-                                <input type="url" id="mon-url" placeholder="https://endpoint.com/health" class="w-full bg-black/60 border border-purple-950 rounded-lg pl-10 pr-4 py-2.5 text-white placeholder-gray-700 focus:outline-none focus:border-cyan-500 text-xs">
-                            </div>
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Routing URL / Connection Destination</label>
+                            <input type="url" id="target-url" class="w-full crypto-input rounded-lg p-2.5" placeholder="https://host.com/health">
                         </div>
+                        <div>
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Polling Cycle Schedule Duration</label>
+                            <select id="target-interval" class="w-full crypto-input rounded-lg p-2.5 cursor-pointer">
+                                <option value="1">1 Minute Sequence Hyper-Pulse</option>
+                                <option value="5" selected>5 Minutes Standard Premium Sequence</option>
+                                <option value="15">15 Minutes Conservative Allocation Mode</option>
+                            </select>
+                        </div>
+                        <button onclick="injectTargetNodePipeline()" class="w-full py-3 bg-purple-600 hover:bg-purple-500 text-black font-black uppercase tracking-wider rounded-xl font-vip transition-all">DEPLOY ENDPOINT PIPELINE</button>
                     </div>
-                    <div class="mb-6">
-                        <label class="block text-xs font-bold text-cyan-400/80 mb-1.5 uppercase tracking-wide">Transmission Duty Cycle</label>
-                        <select id="mon-interval" class="w-full bg-black/60 border border-purple-950 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-cyan-500 text-xs cursor-pointer">
-                            <option value="1">Hyper-Pulse Engine Mode (1 Minute)</option>
-                            <option value="5" selected>Standard Premium Verification (5 Minutes)</option>
-                            <option value="15">Balanced Matrix Grid Logic (15 Minutes)</option>
-                            <option value="30">Deep Sequence Resource Safe (30 Minutes)</option>
-                        </select>
-                    </div>
-                    <button onclick="deployMonitor()" class="w-full bg-gradient-to-r from-cyan-500 via-purple-600 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 text-black font-black py-3 rounded-xl tracking-widest uppercase text-xs font-orbitron shadow-lg transition-all">
-                        <i class="fa-solid fa-satellite-dish mr-1.5 text-sm"></i> DEPLOY TARGET SEQUENCE
-                    </button>
                 </div>
 
-                <!-- Global Logic Configuration Dashboard -->
-                <div class="matrix-panel p-6 rounded-2xl border border-purple-500/10 flex flex-col justify-between shadow-2xl">
-                    <div>
-                        <h2 class="text-sm font-bold text-purple-400 mb-6 flex items-center gap-2 uppercase tracking-widest font-orbitron"><i class="fa-solid fa-gears text-purple-400"></i> KERNEL CONFIG</h2>
-                        <div class="mb-4">
-                            <label class="block text-xs font-bold text-purple-400/80 mb-2 uppercase tracking-wide">Connection Deadline (Sec)</label>
-                            <input type="number" id="settings-timeout" min="2" max="60" class="w-full bg-black/60 border border-purple-950 rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-purple-500 text-xs">
-                        </div>
-                        <div class="mb-4 flex items-center justify-between bg-black/50 border border-purple-950/50 p-3 rounded-lg">
-                            <span class="text-xs font-bold text-purple-400/80 uppercase tracking-wide">Live Stream Synchronizer</span>
-                            <input type="checkbox" id="settings-refresh" class="w-4 h-4 accent-purple-500 cursor-pointer">
-                        </div>
-                    </div>
-                    <button onclick="saveGlobalConfig()" class="w-full px-4 py-2.5 text-center rounded-xl font-bold text-xs tracking-widest uppercase text-purple-400 cyber-btn cyber-btn-purple transition-all">SAVE KERNEL SETTINGS</button>
+                <!-- Live Monitoring Dynamic Streams Grid Panel Layout -->
+                <div class="lg:col-span-2 vip-panel p-6 rounded-2xl space-y-4">
+                    <h2 class="text-xs font-bold text-white font-vip uppercase tracking-widest flex items-center gap-1.5 text-vip-neon"><i class="fa-solid fa-network-wired text-purple-400"></i> LIVE DESIGNATED NETWORK CHANNELS TARGET TRACKS GRID</h2>
+                    <div id="channels-grid-container" class="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[500px] overflow-y-auto pr-2"></div>
                 </div>
             </div>
-
-            <!-- Live Stream Filter/Searching Control Board -->
-            <div class="bg-black/60 border border-purple-950/40 p-4 rounded-xl mb-6 flex flex-col md:flex-row gap-4 items-center justify-between backdrop-blur-md">
-                <div class="flex flex-wrap items-center gap-3 w-full md:w-auto">
-                    <div class="relative w-full sm:w-64">
-                        <i class="fa-solid fa-search absolute left-3 top-3 text-purple-500/60 text-xs"></i>
-                        <input type="text" id="search-bar" oninput="applyFiltersAndSorting()" placeholder="Search designated channel traces..." class="w-full bg-black/80 border border-purple-950 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-cyan-500 text-gray-300">
-                    </div>
-                    <div class="flex bg-black/80 border border-purple-950 p-1 rounded-lg text-xs font-bold">
-                        <button onclick="setStatusFilter('ALL')" id="tab-ALL" class="px-3 py-1.5 rounded bg-purple-950 text-purple-400">ALL TARGETS</button>
-                        <button onclick="setStatusFilter('UP')" id="tab-UP" class="px-3 py-1.5 rounded text-gray-500 hover:text-cyan-400">SECURE (UP)</button>
-                        <button onclick="setStatusFilter('DOWN')" id="tab-DOWN" class="px-3 py-1.5 rounded text-gray-500 hover:text-rose-400">CRITICAL (DOWN)</button>
-                        <button onclick="setStatusFilter('STOPPED')" id="tab-STOPPED" class="px-3 py-1.5 rounded text-gray-500 hover:text-purple-400">SUSPENDED</button>
-                    </div>
-                </div>
-                <div class="flex items-center gap-3 w-full md:w-auto justify-end">
-                    <span class="text-xs text-gray-500 uppercase tracking-widest"><i class="fa-solid fa-sort mr-1"></i> Sequence Order:</span>
-                    <select id="sort-engine" onchange="applyFiltersAndSorting()" class="bg-black border border-purple-950 rounded-lg px-3 py-2 text-xs text-gray-300 focus:outline-none focus:border-purple-500 cursor-pointer">
-                        <option value="name">Identifier Tag</option>
-                        <option value="uptime">Health Percentage</option>
-                        <option value="response_time">Response Latency</option>
-                    </select>
-                    <button onclick="downloadBackup()" class="px-3 py-2 text-xs font-bold rounded-lg text-cyan-400 cyber-btn transition-all uppercase tracking-widest">DUMP BACKUP</button>
-                </div>
-            </div>
-
-            <!-- Dedicated Channel Transmission Targets Grid -->
-            <div id="monitors-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8"></div>
-
-            <!-- Realtime Terminal Log Operations Panel -->
-            <div class="mb-6">
-                <div id="terminal-log" class="terminal-view p-4 text-xs text-cyan-400 space-y-1 rounded-xl">
-                    <div>[SYSTEM GATEWAY KERNEL LEVEL INITIALIZING] Main cryptographic verification routines loaded...</div>
-                </div>
-            </div>
-
-            <footer class="text-center text-xs text-gray-700 border-t border-purple-950/20 pt-6">
-                <p>&copy; 2026 <span class="text-purple-500/40 font-bold">SPEED_X</span> • AUTHORIZED SYSTEM INFRASTRUCTURE FRAMEWORK LABS.</p>
-            </footer>
         </div>
 
         <script>
-            let currentCachedMonitors = [];
-            let activeStatusFilter = 'ALL';
-            let isAudioEnabled = true;
-            let autoRefreshIntervalId = null;
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            let sessionState = { token: "", role: "", user_id: null };
 
-            function playSoundFx(type) {
-                if (!isAudioEnabled) return;
-                const osc = audioCtx.createOscillator();
-                const gain = audioCtx.createGain();
-                osc.connect(gain); gain.connect(audioCtx.destination);
-                if (type === 'success') {
-                    osc.type = 'sine'; osc.frequency.setValueAtTime(880, audioCtx.currentTime);
-                    gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
-                    osc.start(); osc.stop(audioCtx.currentTime + 0.1);
-                } else if (type === 'alert') {
-                    osc.type = 'sawtooth'; osc.frequency.setValueAtTime(180, audioCtx.currentTime);
-                    gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
-                    osc.start(); osc.stop(audioCtx.currentTime + 0.2);
-                } else if (type === 'click') {
-                    osc.type = 'square'; osc.frequency.setValueAtTime(600, audioCtx.currentTime);
-                    gain.gain.setValueAtTime(0.02, audioCtx.currentTime);
-                    osc.start(); osc.stop(audioCtx.currentTime + 0.03);
-                }
-            }
-
-            function printTerminalLog(msg, isErr=false) {
-                const term = document.getElementById('terminal-log');
-                const timestamp = new Date().toISOString().slice(11, 19);
-                const logNode = document.createElement('div');
-                let theme = isErr ? 'text-rose-500' : 'text-cyan-400';
-                logNode.innerHTML = `<span class="text-purple-600">[${timestamp}]</span> <span class="${theme}">${msg}</span>`;
-                term.appendChild(logNode);
-                term.scrollTop = term.scrollHeight;
-            }
-
-            function toggleAudio() {
-                isAudioEnabled = !isAudioEnabled;
-                const btn = document.getElementById('audio-btn');
-                btn.innerHTML = isAudioEnabled ? `<i class="fa-solid fa-volume-high"></i> SFX: ACTIVE` : `<i class="fa-solid fa-volume-xmark"></i> SFX: MUTED`;
-                playSoundFx('click');
-            }
-
-            function showToast(message, type = 'info') {
-                const toast = document.createElement('div');
-                let theme = type === 'success' ? 'border-emerald-500 text-emerald-400' : type === 'error' ? 'border-rose-500 text-rose-400' : 'border-cyan-500 text-cyan-400';
-                toast.className = `matrix-panel px-4 py-3 rounded-xl border-l-4 ${theme} shadow-2xl text-xs flex items-center gap-2`;
-                toast.innerHTML = `<span>${message}</span>`;
-                document.getElementById('toast-container').appendChild(toast);
-                setTimeout(() => toast.remove(), 3500);
-            }
-
-            particlesJS('particles-js', {
-                "particles": {
-                    "number": { "value": 50 }, "color": { "value": "#a855f7" },
-                    "opacity": { "value": 0.2 }, "size": { "value": 2 },
-                    "line_linked": { "enable": true, "distance": 130, "color": "#06b6d4", "opacity": 0.08 },
-                    "move": { "enable": true, "speed": 1.0 }
-                }
-            });
-
-            async function refreshDashboard(isSilent = false) {
+            async function attemptPerimeterAuthentication() {
+                const key = document.getElementById("gateway-security-key").value.trim();
+                if(!key) return alert("Access Key Required.");
+                const devId = fetchHardwareNodeSignature();
                 try {
-                    const statsRes = await fetch('/api/stats');
-                    const stats = await statsRes.json();
-                    document.getElementById('stat-total').innerText = stats.total;
-                    document.getElementById('stat-active').innerText = stats.active;
-                    document.getElementById('stat-up').innerText = stats.up;
-                    document.getElementById('stat-down').innerText = stats.down;
-                    document.getElementById('stat-checks').innerText = stats.total_checks;
-                    document.getElementById('settings-timeout').value = stats.settings.global_timeout;
-                    document.getElementById('settings-refresh').checked = stats.settings.auto_refresh;
+                    const res = await fetch("/api/auth/verify", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ key: key, device_id: devId })
+                    });
+                    if(!res.ok) { const err = await res.json(); alert(err.detail || "Authentication Refused."); return; }
                     
-                    initAutoRefreshLoop(stats.settings.auto_refresh);
-                    const listRes = await fetch('/api/monitors');
-                    currentCachedMonitors = await listRes.json();
-                    applyFiltersAndSorting();
-                    if (!isSilent) printTerminalLog("Database synchronized with memory registries.");
-                } catch (err) { 
-                    printTerminalLog("CRITICAL MAIN INTERFACE SYNC ERROR.", true); 
-                }
+                    const data = await res.json();
+                    sessionState.token = data.token;
+                    sessionState.role = data.role;
+                    sessionState.user_id = data.user_id;
+
+                    document.getElementById("auth-wall-container").classList.add("hidden");
+                    const appWorkspace = document.getElementById("mainframe-application-workspace");
+                    appWorkspace.classList.remove("hidden");
+                    
+                    document.getElementById("role-badge").innerText = `${data.role.toUpperCase()} CORE ACCESS`;
+                    if(data.role === "owner") {
+                        document.getElementById("owner-exclusive-operations-box").classList.remove("hidden");
+                    }
+                    synchronizeChannelsGrid();
+                    setInterval(synchronizeChannelsGrid, 10000);
+                } catch(e) { alert("Matrix Core Connection Exception Refused System Network Entry."); }
             }
 
-            function setStatusFilter(status) {
-                playSoundFx('click');
-                activeStatusFilter = status;
-                ['ALL', 'UP', 'DOWN', 'STOPPED'].forEach(st => {
-                    document.getElementById(`tab-${st}`).className = st === status ? "px-3 py-1.5 rounded bg-purple-950 text-purple-400" : "px-3 py-1.5 rounded text-gray-500 hover:text-cyan-400";
-                });
-                applyFiltersAndSorting();
-            }
-
-            function applyFiltersAndSorting() {
-                const query = document.getElementById('search-bar').value.toLowerCase().trim();
-                const sortBy = document.getElementById('sort-engine').value;
-                let data = [...currentCachedMonitors];
-                if(activeStatusFilter !== 'ALL') data = data.filter(m => m.status === activeStatusFilter);
-                if(query) data = data.filter(m => m.name.toLowerCase().includes(query) || m.url.toLowerCase().includes(query));
-                data.sort((a, b) => sortBy === 'name' ? a.name.localeCompare(b.name) : b[sortBy] - a[sortBy]);
-                renderMatrixGrid(data);
-            }
-
-            function renderMatrixGrid(dataList) {
-                const container = document.getElementById('monitors-grid');
-                container.innerHTML = dataList.length === 0 ? `<div class="matrix-panel p-12 rounded-xl text-center text-xs col-span-2 text-gray-600 tracking-wider">NO MONITOR NODES MATRICES IN VIEW REGISTRY.</div>` : '';
-                dataList.forEach(m => {
-                    let borderTheme = m.status === 'UP' ? 'border-l-emerald-500 cyber-glow-cyan' : m.status === 'DOWN' ? 'border-l-rose-500 cyber-glow-purple' : 'border-l-gray-700';
-                    let badge = m.status === 'UP' ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" : m.status === 'DOWN' ? "bg-rose-500/10 text-rose-400 border-rose-500/20" : "bg-gray-900 text-gray-500 border-gray-800";
-                    const card = document.createElement('div');
-                    card.className = `matrix-panel p-5 rounded-xl border-l-4 ${borderTheme}`;
-                    card.innerHTML = `
-                        <div class="flex justify-between items-start mb-3 gap-2">
-                            <div>
-                                <h3 class="text-sm font-bold text-gray-100 font-orbitron tracking-wide">${m.name} <span class="text-xs text-purple-400 font-mono">[${m.status_code}]</span></h3>
-                                <p class="text-xs text-cyan-600/70 break-all select-all font-mono mt-0.5">${m.url}</p>
+            async function synchronizeChannelsGrid() {
+                try {
+                    const res = await fetch(`/api/monitors?user_id=${sessionState.user_id}&role=${sessionState.role}`);
+                    const data = await res.json();
+                    const container = document.getElementById("channels-grid-container");
+                    container.innerHTML = data.length === 0 ? '<div class="text-xs text-gray-600 col-span-2 text-center p-12 tracking-widest">NO SIGNALS ROUTED TO CURRENT MATRIX PIPELINE.</div>' : '';
+                    
+                    data.forEach(m => {
+                        const div = document.createElement("div");
+                        let isUp = m.status === 'UP';
+                        let borderStyle = isUp ? 'border-l-emerald-500 vip-glow-glow' : m.status === 'DOWN' ? 'border-l-rose-500' : 'border-l-gray-600';
+                        div.className = `vip-panel p-4 rounded-xl border-l-4 ${borderStyle} text-xs space-y-2 transition-all`;
+                        div.innerHTML = `
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <h4 class="font-bold text-white tracking-wide uppercase">${m.name} <span class="text-purple-500 font-mono">[${m.status_code}]</span></h4>
+                                    <p class="text-[11px] text-purple-400/60 break-all select-all mt-0.5">${m.url}</p>
+                                </div>
+                                <span class="px-2 py-0.5 text-[9px] font-black tracking-widest rounded border ${isUp ? 'bg-emerald-950/40 text-emerald-400 border-emerald-500/20' : 'bg-rose-950/40 text-rose-400 border-rose-500/20'}">${m.status}</span>
                             </div>
-                            <span class="px-2 py-0.5 text-[10px] rounded border uppercase font-bold tracking-wider shrink-0 ${badge}">${m.status}</span>
-                        </div>
-                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 bg-black/50 border border-purple-950/20 p-2.5 rounded-lg text-xs text-gray-400 mb-4">
-                            <div>Latency: <span class="text-cyan-400 font-bold">${m.response_time}ms</span></div>
-                            <div>Health: <span class="text-purple-400 font-bold">${m.uptime}%</span></div>
-                            <div>Pings: <span class="text-amber-400 font-bold">${m.success_checks}/${m.total_checks}</span></div>
-                            <div>Cycle: <span class="text-white font-bold">${m.interval}m</span></div>
-                        </div>
-                        <div class="flex gap-2">
-                            <button onclick="toggleChannel('${m.id}')" class="px-3 py-1 bg-black/40 border border-purple-950 hover:border-purple-500 text-gray-300 rounded-lg text-xs transition-all">${m.is_active ? 'Suspend' : 'Activate'}</button>
-                            <button onclick="forcePing('${m.id}')" class="px-3 py-1 bg-cyan-950/20 text-cyan-400 border border-cyan-900/40 hover:border-cyan-500 rounded-lg text-xs transition-all">Pulse Manual</button>
-                            <button onclick="destroyChannel('${m.id}')" class="px-3 py-1 text-rose-400 border border-transparent hover:border-rose-900 rounded-lg text-xs font-bold ml-auto transition-all">Terminate</button>
-                        </div>`;
-                    container.appendChild(card);
-                });
+                            <div class="grid grid-cols-2 gap-2 bg-black/40 border border-purple-950/30 p-2 rounded text-[11px] text-gray-400">
+                                <div>Latency: <span class="text-purple-400 font-bold">${m.response_time}ms</span></div>
+                                <div>Health Metrics: <span class="text-white font-bold">${m.uptime}%</span></div>
+                            </div>
+                            <div class="flex gap-2 pt-1">
+                                <button onclick="executeNodeToggle('${m.id}')" class="px-3 py-1 bg-purple-950/40 border border-purple-900 text-purple-300 rounded hover:border-purple-500 transition-all">${m.is_active ? 'Suspend' : 'Activate'}</button>
+                                <button onclick="executeNodeIsolationTermination('${m.id}')" class="px-3 py-1 text-rose-400 border border-transparent hover:border-rose-950 rounded font-bold ml-auto transition-all">Terminate</button>
+                            </div>
+                        `;
+                        container.appendChild(div);
+                    });
+                } catch(e) {}
             }
 
-            async function deployMonitor() {
-                playSoundFx('click');
-                const name = document.getElementById('mon-name').value.trim();
-                const url = document.getElementById('mon-url').value.trim();
-                const interval = document.getElementById('mon-interval').value;
-                if(!name || !url) return showToast('Execution failed: Missing properties!', 'error');
+            async function injectTargetNodePipeline() {
+                const name = document.getElementById("target-name").value.trim();
+                const url = document.getElementById("target-url").value.trim();
+                const interval = document.getElementById("target-interval").value;
+                if(!name || !url) return alert("All profile properties must be specified prior to pipeline initialization.");
                 
-                printTerminalLog(`Injecting path vector: ${name}...`);
-                await fetch('/api/monitors', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, url, interval: parseInt(interval) })
+                const res = await fetch("/api/monitors", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ user_id: sessionState.user_id, role: sessionState.role, name, url, interval })
                 });
-                document.getElementById('mon-name').value = '';
-                document.getElementById('mon-url').value = '';
-                showToast('Target signal accepted by matrix module.', 'success');
-                playSoundFx('success');
-                refreshDashboard(true);
+                if(res.ok) {
+                    document.getElementById("target-name").value = "";
+                    document.getElementById("target-url").value = "";
+                    synchronizeChannelsGrid();
+                } else { const err = await res.json(); alert(err.detail || "Injection Refused."); }
             }
 
-            async function saveGlobalConfig() {
-                playSoundFx('click');
-                const timeout = parseInt(document.getElementById('settings-timeout').value);
-                const autoRefresh = document.getElementById('settings-refresh').checked;
-                await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ global_timeout: timeout, auto_refresh: autoRefresh })
+            async function executeNodeToggle(mid) {
+                await fetch(`/api/monitors/${mid}/toggle`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ user_id: sessionState.user_id, role: sessionState.role })
                 });
-                printTerminalLog("Kernel synchronization cycle committed.");
-                showToast('Kernel modifications active.', 'success');
-                refreshDashboard(true);
+                synchronizeChannelsGrid();
             }
 
-            function initAutoRefreshLoop(status) {
-                if(autoRefreshIntervalId) clearInterval(autoRefreshIntervalId);
-                if(status) autoRefreshIntervalId = setInterval(() => refreshDashboard(true), 15000);
-            }
-
-            async function forcePing(id) {
-                playSoundFx('click');
-                printTerminalLog(`Forcing physical manual connection scan to channel ID: ${id}`);
-                await fetch(`/api/monitors/${id}/ping`, { method: 'POST' });
-                refreshDashboard(true);
-            }
-
-            async function toggleChannel(id) {
-                playSoundFx('click');
-                await fetch(`/api/monitors/${id}/toggle`, { method: 'POST' });
-                refreshDashboard(true);
-            }
-
-            async function globalAction(action) {
-                playSoundFx('click');
-                printTerminalLog(`Broadcasting global operation execution: [${action.toUpperCase()}]`);
-                await fetch(`/api/global/${action}`, { method: 'POST' });
-                refreshDashboard(true);
-            }
-
-            async function globalPurge() {
-                playSoundFx('alert');
-                if(confirm('Wipe core tracking allocations database completely?')) {
-                    await fetch('/api/global/purge', { method: 'POST' });
-                    printTerminalLog("CRITICAL LOG: Global data purge commanded.", true);
-                    refreshDashboard(true);
+            async function executeNodeIsolationTermination(mid) {
+                if(confirm("Are you sure you want to terminate this endpoint channel sequence?")) {
+                    await fetch(`/api/monitors/${mid}?user_id=${sessionState.user_id}&role=${sessionState.role}`, { method: "DELETE" });
+                    synchronizeChannelsGrid();
                 }
             }
 
-            async function destroyChannel(id) {
-                playSoundFx('alert');
-                if(confirm('Completely isolate and terminate channel node?')) {
-                    await fetch(`/api/monitors/${id}`, { method: 'DELETE' });
-                    printTerminalLog(`Channel ${id} terminated and wiped.`);
-                    refreshDashboard(true);
-                }
+            function destroyLocalSession() { window.location.reload(); }
+
+            async function triggerDatabaseExportDownload() {
+                const res = await fetch(`/api/monitors?user_id=${sessionState.user_id}&role=${sessionState.role}`);
+                const monitorsList = await res.json();
+                const blob = new Blob([JSON.stringify({users: {}, monitors: monitorsList, redeem_codes: {}, web_keys: []}, null, 4)], {type : 'application/json'});
+                const anchor = document.createElement('a'); anchor.href = URL.createObjectURL(blob);
+                anchor.download = "matrix_snapshot_backup.json"; anchor.click(); anchor.remove();
             }
 
-            function downloadBackup() {
-                playSoundFx('click');
-                if(currentCachedMonitors.length === 0) return;
-                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentCachedMonitors, null, 2));
-                const anchor = document.createElement('a');
-                anchor.setAttribute("href", dataStr); anchor.setAttribute("download", "matrix_core_backup.json");
-                anchor.click(); anchor.remove();
+            function commitDatabaseOverrideUpload() {
+                const filePicker = document.getElementById("db-file-picker");
+                if(filePicker.files.length === 0) return alert("Select a template JSON structural matrix configuration payload asset array first.");
+                const fileReader = new FileReader();
+                fileReader.onload = async function(e) {
+                    try {
+                        const dataObj = JSON.parse(e.target.result);
+                        const res = await fetch("/api/system/upload_db", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ role: sessionState.role, token: sessionState.token, database_json: dataObj })
+                        });
+                        if(res.ok) { alert("Core Database registries completely replaced and synchronized successfully."); synchronizeChannelsGrid(); }
+                        else { alert("Internal Error executing file replacement override layer mapping pipeline."); }
+                    } catch(err) { alert("JSON structural framing error compilation syntax failure analysis rejected."); }
+                };
+                fileReader.readAsText(filePicker.files[0]);
             }
-
-            window.onload = () => refreshDashboard(false);
         </script>
     </body>
     </html>
     """
-    return HTMLResponse(content=html_content)
-
 
 if __name__ == "__main__":
     import uvicorn
