@@ -10,13 +10,12 @@
 import os
 import time
 import json
-import uuid
 import secrets
 import asyncio
 import httpx
 from typing import List, Dict, Optional
-from fastapi import FastAPI, HTTPException, Request, Depends, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
@@ -25,11 +24,10 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 BOT_TOKEN = "8853802336:AAE1_izH6uR7H-sWrr7jnMd06eP5MHL2x54"
-OWNER_ID = 7224513731  # Replace with your actual Telegram User ID
+OWNER_ID = 7224513731
 
 DB_FILE = "matrix_database.json"
 
-# --- CORE CENTRAL DATABASE CONFIGURATION ---
 def load_db() -> Dict:
     if os.path.exists(DB_FILE):
         try:
@@ -38,10 +36,10 @@ def load_db() -> Dict:
         except Exception:
             pass
     return {
-        "users": {},         # {user_id: {expiry: timestamp or "lifetime", link_limit: int, devices: [], banned: bool, web_session: str}}
-        "monitors": [],      # [{id, user_id, name, url, interval, status, is_active, ...}]
+        "users": {},         # {user_id: {expiry: timestamp or "lifetime", link_limit: int, max_devices: int, devices: [], banned: bool}}
+        "monitors": [],      # [{id, user_id, name, url, interval, status, is_active}]
         "redeem_codes": {},  # {code: {days: int, link_limit: int, max_devices: int, used: bool}}
-        "web_keys": []       # [keys...]
+        "web_keys": []       
     }
 
 def save_db(data: Dict):
@@ -58,9 +56,9 @@ async def sync_db():
     async with db_lock:
         save_db(db)
 
-# --- ENGINE BACKGROUND CHECKERS ---
 async_client_pool: httpx.AsyncClient = None
 
+# --- ENGINE BACKGROUND CHECKERS ---
 async def check_target_pulse(monitor: Dict):
     start_time = time.time()
     url = monitor['url']
@@ -90,14 +88,12 @@ async def core_monitor_scheduler():
         tasks = []
         current_time = time.time()
         for m in db["monitors"]:
-            # Check user license status prior to pinging
             uid = str(m['user_id'])
             user_info = db["users"].get(uid, {})
             if user_info.get("banned", False):
                 m['is_active'] = False
                 m['status'] = 'SUSPENDED'
                 continue
-            
             if user_info.get("expiry") != "lifetime" and user_info.get("expiry", 0) < current_time:
                 m['is_active'] = False
                 m['status'] = 'EXPIRED'
@@ -114,222 +110,284 @@ async def core_monitor_scheduler():
             await sync_db()
         await asyncio.sleep(5)
 
-# --- TELEGRAM BOT ROUTING INTERFACE ---
-async def bot_start_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- ONE-MENU BUTTON CONTROLLER ROUTER ---
+async def launch_main_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid_str = str(user.id)
     current_time = time.time()
-    
-    # Check Ban Matrix
+
     if db["users"].get(uid_str, {}).get("banned", False):
-        await update.message.reply_text("❌ Your mainframe identity profile has been BANNED by the Owner.")
+        await update.message.reply_text("❌ Your account signature is completely BANNED from this mainframe infrastructure.")
         return
 
-    # Owner Dashboard Route
+    # OWNER INTERFACE (BUTTON BASED ONLY)
     if user.id == OWNER_ID:
-        msg = (
-            f"⚡ *VIP MASTER CONTROL PANEL* ⚡\n\n"
-            f"👑 *Role:* System Owner\n"
-            f"Use the buttons below or terminal commands to configure license allocation sequences."
-        )
+        msg = "⚡ *SPEED_X VIP MASTER CENTRAL ENGINE* ⚡\n\nWelcome back, Owner. Choose operations directly via physical buttons below."
         keyboard = [
-            [InlineKeyboardButton("📊 System Global Statistics", callback_data="adm_stats")],
-            [InlineKeyboardButton("🖥️ Master Targets Grid", callback_data="adm_grid")],
-            [InlineKeyboardButton("🔑 Backup Database Dump", callback_data="adm_backup")]
+            [InlineKeyboardButton("🎫 GEN REDEEM KEY", callback_data="own_step1_time")],
+            [InlineKeyboardButton("👥 MANAGED USERS (BAN/LIMIT)", callback_data="own_users_list")],
+            [InlineKeyboardButton("🌐 WEB DASHBOARD KEY", callback_data="own_webkey")],
+            [InlineKeyboardButton("💾 BACKUP DATABASE DUMP", callback_data="own_backup_db")]
         ]
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # Check Active Licensing
+    # SUBADMIN INTERFACE
     user_data = db["users"].get(uid_str)
     if not user_data or (user_data["expiry"] != "lifetime" and user_data["expiry"] < current_time):
-        welcome_unauth = (
-            f"🛸 *VIP UPTIME MATRIX NETWORK* 🛸\n\n"
-            f"⚠️ *Access Refused:* Unauthorized Node ID: `{user.id}`\n"
-            f"You do not possess an active subscription key runtime.\n\n"
-            f"🛒 Contact the Administrator below to acquire a premium matrix license."
-        )
-        keyboard = [[InlineKeyboardButton("🛍️ BUY PREMIUM LICENSE", url="https://t.me/NIROB_BBZ")]]
-        await update.message.reply_text(welcome_unauth, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        msg = f"🛸 *VIP UPTIME MATRIX PLATFORM* 🛸\n\n⚠️ Unauthorized Profile Node Detected: `{user.id}`\nAccess completely locked. Contact administration to purchase premium verification routines."
+        keyboard = [
+            [InlineKeyboardButton("🛒 BUY PREMIUM LICENSE", url="https://t.me/NIROB_BBZ")],
+            [InlineKeyboardButton("🔑 ENTER REDEEM CODE", callback_data="usr_trigger_redeem")]
+        ]
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # Standard Authenticated Client Route
-    exp_time = "LIFETIME REIGN" if user_data["expiry"] == "lifetime" else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_data["expiry"]))
-    client_msg = (
-        f"🛡️ *VIP CLIENT MAINFRAME NODE* 🛡️\n\n"
-        f"✅ *Status:* Authorized Premium\n"
-        f"📅 *Valid Till:* `{exp_time}`\n"
-        f"🚀 *Link Capacity Allocation:* `{len([m for m in db['monitors'] if m['user_id'] == user.id])}/{user_data['link_limit']}`"
+    exp_text = "LIFETIME REIGN" if user_data["expiry"] == "lifetime" else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(user_data["expiry"]))
+    my_links = [m for m in db["monitors"] if m["user_id"] == user.id]
+    
+    msg = (
+        f"🛡️ *VIP CLIENT MAINFRAME OPERATIONAL* 🛡️\n\n"
+        f"📌 *Identity Node:* `{user.id}`\n"
+        f"📅 *Valid Till:* `{exp_text}`\n"
+        f"🚀 *Capacity Load:* `{len(my_links)}/{user_data['link_limit']}` Links"
     )
     keyboard = [
-        [InlineKeyboardButton("🖥️ Manage My Target Channels", callback_data="usr_grid")],
-        [InlineKeyboardButton("➕ Inject New Endpoint", callback_data="usr_add")]
+        [InlineKeyboardButton("🖥️ VIEW & TOGGLE MY LINKS", callback_data="usr_view_links")]
     ]
-    await update.message.reply_text(client_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def handle_redeem_attempt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def catch_all_messages_and_redeems(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid_str = str(user.id)
     text = update.message.text.strip()
+
+    # Intercept State Actions
+    state = context.user_data.get("state")
     
-    if text.startswith("nirobxuptime_"):
-        if db["users"].get(uid_str, {}).get("banned", False):
-            return
+    if state == "WAITING_REDEEM_CODE":
+        if text.startswith("nirobxuptime_"):
+            code_data = db["redeem_codes"].get(text)
+            if not code_data or code_data.get("used", False):
+                await update.message.reply_text("❌ Token signature corrupted or already exhausted.")
+                return
             
-        code_data = db["redeem_codes"].get(text)
-        if not code_data or code_data.get("used", False):
-            await update.message.reply_text("❌ Transmission Error: Invalid or expired redeem token signature.")
-            return
-        
-        # Initialize or Update User Profile
-        days = code_data["days"]
-        expiry_val = "lifetime" if days == 0 else time.time() + (days * 86400)
-        
-        db["users"][uid_str] = {
-            "expiry": expiry_val,
-            "link_limit": code_data["link_limit"],
-            "max_devices": code_data["max_devices"],
-            "devices": [],
-            "banned": false
-        }
-        code_data["used"] = True
-        await sync_db()
-        
-        await update.message.reply_text(
-            f"🧬 *MATRIX LICENSE ACTIVATED* 🧬\n\n"
-            f"🔑 Token Verified Successfully.\n"
-            f"📊 Link Max Capacity: {code_data['link_limit']}\n"
-            f"⏳ Access Duration: {'LIFETIME' if days == 0 else f'{days} Days'}\n\n"
-            f"Run /start to launch your control matrix interface.", parse_mode="Markdown"
-        )
-
-# --- BOT EXCLUSIVE COMMAND LAYER FOR OWNER ---
-async def cmd_generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    try:
-        # Syntax: /genkey <days> <links> <devices> (0 days means Lifetime)
-        days = int(context.args[0])
-        links = int(context.args[1])
-        devices = int(context.args[2])
-        
-        token = f"nirobxuptime_{secrets.token_hex(4)}"
-        db["redeem_codes"][token] = {
-            "days": days,
-            "link_limit": links,
-            "max_devices": devices,
-            "used": False
-        }
-        await sync_db()
-        
-        duration = "LIFETIME" if days == 0 else f"{days} Days"
-        await update.message.reply_text(
-            f"🎫 *VIP LICENSE TOKEN GENERATED* 🎫\n\n"
-            f"`{token}`\n\n"
-            f"⚙️ Config: {duration} | {links} Max Links | {devices} Devices Limit\n"
-            f"Send this payload string to the intended sub-admin recipient.", parse_mode="Markdown"
-        )
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Owner Format: `/genkey <days_count> <links_limit> <devices_limit>` (Pass 0 days for Lifetime)")
-
-async def cmd_ban_infrastructure(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    try:
-        target_uid = str(context.args[0])
-        if target_uid not in db["users"]: db["users"][target_uid] = {}
-        db["users"][target_uid]["banned"] = True
-        await sync_db()
-        await update.message.reply_text(f"⚔️ Mainframe Identity {target_uid} isolated and BANNED.")
-    except IndexError:
-        await update.message.reply_text("Usage: `/ban <USER_ID>`")
-
-async def cmd_unban_infrastructure(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    try:
-        target_uid = str(context.args[0])
-        if target_uid in db["users"]:
-            db["users"][target_uid]["banned"] = False
+            days = code_data["days"]
+            expiry_val = "lifetime" if days == 0 else time.time() + (days * 86400)
+            db["users"][uid_str] = {
+                "expiry": expiry_val,
+                "link_limit": code_data["link_limit"],
+                "max_devices": code_data["max_devices"],
+                "devices": [],
+                "banned": False
+            }
+            code_data["used"] = True
             await sync_db()
-            await update.message.reply_text(f"🧬 Mainframe Isolation Revoked for ID {target_uid}.")
-    except IndexError:
-        await update.message.reply_text("Usage: `/unban <USER_ID>`")
+            context.user_data["state"] = None
+            
+            keyboard = [[InlineKeyboardButton("🚀 LAUNCH MAINFRAME", callback_data="usr_home_return")]]
+            await update.message.reply_text("🧬 *PREMIUM LICENSE CONNECTED SUCCESSFULY!*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
-async def cmd_modify_link_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    try:
-        target_uid = str(context.args[0])
-        new_lim = int(context.args[1])
-        if target_uid in db["users"]:
-            db["users"][target_uid]["link_limit"] = new_lim
-            await sync_db()
-            await update.message.reply_text(f"🛡️ Target {target_uid} updated with custom max link restriction: {new_lim}")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: `/setlimit <USER_ID> <new_limit>`")
+    if state == "WAITING_CUSTOM_LIMIT" and update.effective_user.id == OWNER_ID:
+        t_user = context.user_data.get("target_user")
+        try:
+            new_lim = int(text)
+            if t_user in db["users"]:
+                db["users"][t_user]["link_limit"] = new_lim
+                await sync_db()
+                context.user_data["state"] = None
+                keyboard = [[InlineKeyboardButton("⬅️ Back to Users", callback_data="own_users_list")]]
+                await update.message.reply_text(f"✅ User ID {t_user} max link limit shifted to: {new_lim}", reply_markup=InlineKeyboardMarkup(keyboard))
+        except ValueError:
+            await update.message.reply_text("Provide a clean integer value configuration.")
+        return
 
-async def cmd_generate_webkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    wkey = f"matrix_key_{secrets.token_urlsafe(16)}"
-    db["web_keys"].append(wkey)
-    await sync_db()
-    await update.message.reply_text(f"🔑 *WEB DASHBOARD GATEWAY ACCESS KEY*\n\n`{wkey}`\n\nUse this authentication signature string to pass the web portal perimeter protection system.", parse_mode="Markdown")
+    # Fallback default route if user enters random text
+    await launch_main_dashboard(update, context)
 
-async def cmd_backup_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
-    await sync_db()
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'rb') as doc:
-            await update.message.reply_document(document=doc, filename="matrix_database_backup.json", caption="⚡ Live Matrix Database Vector Stream Dump Complete.")
-
-# --- TELEGRAM INLINE CALLBACK PROCESSING ROUTINES ---
-async def bot_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- COMPREHENSIVE INTERACTIVE CALLBACK BUTTON PROCESSING ENGINE ---
+async def interface_buttons_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid = query.from_user.id
     uid_str = str(uid)
     data = query.data
 
-    # OWNER CALLBACK MATCHERS
-    if uid == OWNER_ID:
-        if data == "adm_stats":
-            total_users = len(db["users"])
-            total_links = len(db["monitors"])
-            up_links = len([m for m in db["monitors"] if m["status"] == "UP"])
-            msg = f"📊 *GLOBAL ADMINISTRATIVE METRICS*\n\n🔹 Total Systems Profiles: {total_users}\n🔹 Registered Targets: {total_links}\n🟢 Synchronized Secure Nodes: {up_links}"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return Dashboard", callback_data="adm_home")]]))
-        elif data == "adm_grid":
-            msg = "🖥️ *GLOBAL TARGET ALLOCATION NETWORKS*:\n\n"
-            for m in db["monitors"][:15]:
-                status_ico = "🟢" if m["status"] == "UP" else "🔴" if m["status"] == "DOWN" else "⚪"
-                msg += f"{status_ico} ID:`{m['id']}` | User:`{m['user_id']}`\n📌 Name: *{m['name']}*\n🌐 `{m['url']}`\n\n"
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Return Dashboard", callback_data="adm_home")]]))
-        elif data == "adm_home":
-            msg = "⚡ *VIP MASTER CONTROL PANEL* ⚡"
-            keyboard = [
-                [InlineKeyboardButton("📊 System Global Statistics", callback_data="adm_stats")],
-                [InlineKeyboardButton("🖥️ Master Targets Grid", callback_data="adm_grid")]
-            ]
-            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    # User Triggers
+    if data == "usr_trigger_redeem":
+        context.user_data["state"] = "WAITING_REDEEM_CODE"
+        await query.edit_message_text("🔑 *INPUT MODE ACTIVE:*\nPlease type or paste your validation key string directly here (`nirobxuptime_*******`):", parse_mode="Markdown")
+        return
+        
+    if data == "usr_home_return":
+        await launch_main_dashboard(update, context)
         return
 
-    # USER INLINE WORKFLOWS
-    user_conf = db["users"].get(uid_str)
-    if not user_conf or user_conf.get("banned", False): return
+    if data == "usr_view_links":
+        my_links = [m for m in db["monitors"] if m["user_id"] == uid]
+        if not my_links:
+            await query.edit_message_text("⚠️ No tracks mapped to your matrix stream.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="usr_home_return")]]))
+            return
+        msg = "🖥️ *YOUR ACTIVE DESIGNATED TARGET PIPELINES*:\n\n"
+        keyboard = []
+        for m in my_links:
+            status_ico = "🟢" if m["status"] == "UP" else "🔴" if m["status"] == "DOWN" else "⚪"
+            msg += f"{status_ico} Name: *{m['name']}* | Health: `{m['uptime']}%`\n🌐 `{m['url']}`\n\n"
+            toggle_label = f"⚙️ Toggle: {m['name']} [{'ON' if m['is_active'] else 'OFF'}]"
+            keyboard.append([InlineKeyboardButton(toggle_label, callback_data=f"usr_toggle_{m['id']}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back Dashboard", callback_data="usr_home_return")])
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
-    if data == "usr_grid":
-        my_nodes = [m for m in db["monitors"] if m["user_id"] == uid]
-        if not my_nodes:
-            msg = "⚠️ Your sub-allocation profile contains no active network traces inside the database core."
-        else:
-            msg = "🖥️ *YOUR OPERATIONAL CHANNELS*:\n\n"
-            for m in my_nodes:
-                status_ico = "🟢" if m["status"] == "UP" else "🔴" if m["status"] == "DOWN" else "⚪"
-                msg += f"{status_ico} *{m['name']}* ({m['uptime']}% Health)\n`{m['url']}`\n⚙️ Active Status: {m['is_active']}\n\n"
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="usr_home")]]))
-    elif data == "usr_home":
-        client_msg = f"🛡️ *VIP CLIENT MAINFRAME NODE* 🛡️\n\n🚀 Resource Utilization Matrix Panel Loading..."
+    if data.startswith("usr_toggle_"):
+        mid = data.split("_")[2]
+        for m in db["monitors"]:
+            if m["id"] == mid and m["user_id"] == uid:
+                m["is_active"] = not m["is_active"]
+                m["status"] = "PENDING" if m["is_active"] else "STOPPED"
+                await sync_db()
+                break
+        query.data = "usr_view_links"
+        await interface_buttons_dispatcher(update, context)
+        return
+
+    # OWNER CALLBACK EXCLUSIONS
+    if uid != OWNER_ID: return
+
+    if data == "own_main_panel":
+        await launch_main_dashboard(update, context)
+        return
+
+    if data == "own_webkey":
+        wkey = f"matrix_key_{secrets.token_urlsafe(16)}"
+        db["web_keys"].append(wkey)
+        await sync_db()
+        keyboard = [[InlineKeyboardButton("⬅️ Back Menu", callback_data="own_main_panel")]]
+        await query.edit_message_text(f"🔑 *LIVE NEW WEB SECURITY TOKEN:*\n\n`{wkey}`\n\nAuthorized for access configuration schema bypass sequence.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "own_backup_db":
+        await sync_db()
+        keyboard = [[InlineKeyboardButton("⬅️ Back Menu", callback_data="own_main_panel")]]
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, 'rb') as doc:
+                await context.bot.send_document(chat_id=OWNER_ID, document=doc, filename="matrix_database.json", caption="⚡ Complete System Database Schema Struct Vector Dump Transmitted.")
+            await query.edit_message_text("✅ File emitted safely into secure room pipeline.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # Wizard Steps for Key Generation
+    if data == "own_step1_time":
         keyboard = [
-            [InlineKeyboardButton("🖥️ Manage My Target Channels", callback_data="usr_grid")]
+            [InlineKeyboardButton("🗓️ 30 Days Cycle", callback_data="own_step2_links_30")],
+            [InlineKeyboardButton("🗓️ 90 Days Cycle", callback_data="own_step2_links_90")],
+            [InlineKeyboardButton("👑 LIFETIME UNLIMITED", callback_data="own_step2_links_0")]
         ]
-        await query.edit_message_text(client_msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("⚡ *KEY GENERATION STAGE [1/3]*:\nSelect license duration criteria:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("own_step2_links_"):
+        days = data.split("_")[3]
+        keyboard = [
+            [InlineKeyboardButton("🚀 5 Channels", callback_data=f"own_step3_devs_{days}_5")],
+            [InlineKeyboardButton("🚀 15 Channels", callback_data=f"own_step3_devs_{days}_15")],
+            [InlineKeyboardButton("🚀 50 Channels Max", callback_data=f"own_step3_devs_{days}_50")]
+        ]
+        await query.edit_message_text("⚡ *KEY GENERATION STAGE [2/3]*:\nSelect Maximum quantitative track payload allocations limits:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("own_step3_devs_"):
+        parts = data.split("_")
+        days = int(parts[3])
+        links = int(parts[4])
+        
+        keyboard = [
+            [InlineKeyboardButton("📱 1 Hardware Identity", callback_data=f"own_finish_gen_{days}_{links}_1")],
+            [InlineKeyboardButton("📱 3 Multi-Device Nodes", callback_data=f"own_finish_gen_{days}_{links}_3")],
+            [InlineKeyboardButton("📱 5 Concurrent Rig Rings", callback_data=f"own_finish_gen_{days}_{links}_5")]
+        ]
+        await query.edit_message_text("⚡ *KEY GENERATION STAGE [3/3]*:\nSelect concurrent secure active hardware device threshold limit:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("own_finish_gen_"):
+        parts = data.split("_")
+        days, links, devs = int(parts[3]), int(parts[4]), int(parts[5])
+        token = f"nirobxuptime_{secrets.token_hex(4).upper()}"
+        
+        db["redeem_codes"][token] = {
+            "days": days, "link_limit": links, "max_devices": devs, "used": False
+        }
+        await sync_db()
+        keyboard = [[InlineKeyboardButton("⬅️ Main Dashboard Engine", callback_data="own_main_panel")]]
+        duration_text = "LIFETIME REIGN" if days == 0 else f"{days} Days"
+        await query.edit_message_text(f"🎫 *VIP QUANTUM TICKET GENERATED SUCCESSFULLY* 🎫\n\n`{token}`\n\n⚙️ Config Payload:\n🔹 Duration: {duration_text}\n🔹 Monitor Capacity: {links} Tracks\n🔹 Device Ceiling: {devs} HW Nodes", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # User Management Block Buttons Layer Routines
+    if data == "own_users_list":
+        if not db["users"]:
+            await query.edit_message_text("⚠️ No records inside active profile ledger database arrays.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back Menu", callback_data="own_main_panel")]]))
+            return
+        msg = "👥 *MASTER SYSTEM MANAGEMENT PROFILES LEDGER*:\nSelect target user string execution node:\n\n"
+        keyboard = []
+        for uid_key, ucon in db["users"].items():
+            ban_status_label = "🚫 BANNED" if ucon.get("banned") else "🟢 ACTIVE"
+            keyboard.append([InlineKeyboardButton(f"User: {uid_key} [{ban_status_label}]", callback_data=f"own_manageuser_{uid_key}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back Dashboard Menu", callback_data="own_main_panel")])
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("own_manageuser_"):
+        t_uid = data.split("_")[2]
+        ucon = db["users"].get(t_uid, {})
+        my_links = [m for m in db["monitors"] if m["user_id"] == int(t_uid)]
+        
+        msg = (
+            f"👤 *PROFILE MAINTENANCE CONSOLE INTERFACE* 👤\n\n"
+            f"🔹 User Core ID Node: `{t_uid}`\n"
+            f"🔹 Status: `{'BANNED BLOCK' if ucon.get('banned') else 'OPERATIONAL SECURE'}`\n"
+            f"🔹 Config Limit Trace Ceiling: `{ucon.get('link_limit')}` Links\n"
+            f"🔹 Running Tracks Mapped: `{len(my_links)}` Active Objects"
+        )
+        keyboard = [
+            [InlineKeyboardButton("🚫 INSTANT BAN", callback_data=f"own_execban_{t_uid}"), InlineKeyboardButton("🔓 REMOVE BAN", callback_data=f"own_execunban_{t_uid}")],
+            [InlineKeyboardButton("⚙️ ADJUST MAX LINK CAPACITY", callback_data=f"own_execlimit_{t_uid}")],
+            [InlineKeyboardButton("⬅️ Back List Ledger", callback_data="own_users_list")]
+        ]
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("own_execban_"):
+        t_uid = data.split("_")[2]
+        db["users"][t_uid]["banned"] = True
+        await sync_db()
+        query.data = f"own_manageuser_{t_uid}"
+        await interface_buttons_dispatcher(update, context)
+        return
+
+    if data.startswith("own_execunban_"):
+        t_uid = data.split("_")[2]
+        db["users"][t_uid]["banned"] = False
+        await sync_db()
+        query.data = f"own_manageuser_{t_uid}"
+        await interface_buttons_dispatcher(update, context)
+        return
+
+    if data.startswith("own_execlimit_"):
+        t_uid = data.split("_")[2]
+        context.user_data["state"] = "WAITING_CUSTOM_LIMIT"
+        context.user_data["target_user"] = t_uid
+        await query.edit_message_text(f"🔢 Input new max quantitative channel constraint count integer value for ID `{t_uid}`:", parse_mode="Markdown")
+        return
 
 # --- FASTAPI WEB LIFECYCLE MANAGEMENT ---
 @asynccontextmanager
@@ -337,17 +395,10 @@ async def app_lifespan(app: FastAPI):
     global async_client_pool
     async_client_pool = httpx.AsyncClient(limits=httpx.Limits(max_connections=200, max_keepalive_connections=50))
     
-    # Initialize Application Bot Orchestration Layer
     bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", bot_start_router))
-    bot_app.add_handler(CommandHandler("genkey", cmd_generate_token))
-    bot_app.add_handler(CommandHandler("ban", cmd_ban_infrastructure))
-    bot_app.add_handler(CommandHandler("unban", cmd_unban_infrastructure))
-    bot_app.add_handler(CommandHandler("setlimit", cmd_modify_link_limit))
-    bot_app.add_handler(CommandHandler("webkey", cmd_generate_webkey))
-    bot_app.add_handler(CommandHandler("backup", cmd_backup_json))
-    bot_app.add_handler(CallbackQueryHandler(bot_callback_handler))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redeem_attempt))
+    bot_app.add_handler(CommandHandler("start", launch_main_dashboard))
+    bot_app.add_handler(CallbackQueryHandler(interface_buttons_dispatcher))
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_all_messages_and_redeems))
     
     await bot_app.initialize()
     await bot_app.start()
@@ -362,25 +413,22 @@ async def app_lifespan(app: FastAPI):
 
 app = FastAPI(title="VIP Central Matrix System By SPEED_X", lifespan=app_lifespan)
 
-# --- BACKEND REST API ENDPOINTS CONTROLLERS ---
+# --- WEB BACKEND API ENDPOINTS ROUTERS ---
 @app.post("/api/auth/verify")
 async def verify_web_key(payload: Dict):
     key = payload.get("key")
     device_id = payload.get("device_id", "web_node")
     if not key: raise HTTPException(status_code=400, detail="Missing Authentication Matrix Key")
     
-    # Owner Authorization Check
     if key in db["web_keys"]:
         return {"status": "authorized", "role": "owner", "token": key, "user_id": OWNER_ID}
     
-    # Check if Key matches user subscription session token
     for uid_str, udata in db["users"].items():
         if udata.get("banned", False): continue
-        # For simplicity, let sub-admins present their Active Redeem Code as Web Key 
         if key in db["redeem_codes"]:
             if device_id not in udata["devices"]:
                 if len(udata["devices"]) >= udata["max_devices"]:
-                    raise HTTPException(status_code=403, detail="Device Registration Matrix Denied: Hard Hardware Ceiling Hit.")
+                    raise HTTPException(status_code=403, detail="Device Registration Matrix Denied: Hardware Limit Reached.")
                 udata["devices"].append(device_id)
                 await sync_db()
             return {"status": "authorized", "role": "subadmin", "token": key, "user_id": int(uid_str)}
@@ -389,8 +437,7 @@ async def verify_web_key(payload: Dict):
 
 @app.get("/api/monitors")
 async def fetch_api_monitors(user_id: int, role: str):
-    if role == "owner":
-        return db["monitors"]
+    if role == "owner": return db["monitors"]
     return [m for m in db["monitors"] if m["user_id"] == user_id]
 
 @app.post("/api/monitors")
@@ -452,19 +499,18 @@ async def delete_api_monitor(mid: str, user_id: int, role: str):
     await sync_db()
     return {"success": True}
 
-# --- MASTER DATABASE RE-UPLOAD SYSTEM MANAGEMENT ENDPOINTS ---
 @app.post("/api/system/upload_db")
 async def system_replace_db(payload: Dict):
     global db
     if payload.get("role") != "owner": raise HTTPException(status_code=403, detail="Access Denied")
     incoming_data = payload.get("database_json")
     if not incoming_data or "users" not in incoming_data or "monitors" not in incoming_data:
-        raise HTTPException(status_code=400, detail="Malformed structure schematic architecture framework.")
+        raise HTTPException(status_code=400, detail="Malformed structure schematic asset array.")
     db = incoming_data
     await sync_db()
-    return {"success": True, "detail": "Core Database structures overwritten successfully matching standard payload schema."}
+    return {"success": True}
 
-# --- FULL NEXT-GEN REDESIGNED VIP MATRICES WEB FRONTEND APPLICATION LAYER ---
+# --- NEXT-GEN REDESIGNED VIP MATRICES WEB FRONTEND APPLICATION LAYER ---
 @app.get("/", response_class=HTMLResponse)
 async def deliver_nextgen_ui():
     return """
@@ -488,7 +534,6 @@ async def deliver_nextgen_ui():
         </style>
         <script>
             document.addEventListener('contextmenu', e => e.preventDefault());
-            // Hardware fingerprints mapping strategy
             function fetchHardwareNodeSignature() {
                 let sig = localStorage.getItem('matrix_hardware_signature');
                 if(!sig) { sig = 'node_hw_' + Math.random().toString(36).substring(2, 15); localStorage.setItem('matrix_hardware_signature', sig); }
@@ -497,82 +542,77 @@ async def deliver_nextgen_ui():
         </script>
     </head>
     <body class="min-h-screen relative p-4 flex items-center justify-center">
-        <!-- AUTH GATEWAY PROTECTION INTERFACE CONSOLE -->
         <div id="auth-wall-container" class="w-full max-w-md vip-panel p-8 rounded-2xl border-t-4 border-t-purple-600 z-50 relative">
             <div class="text-center mb-6">
                 <div class="inline-block p-3 bg-purple-950/40 rounded-full mb-3 border border-purple-500/30">
                     <i class="fa-solid fa-user-shield text-3xl text-purple-400"></i>
                 </div>
                 <h1 class="text-2xl font-black tracking-widest font-vip text-white text-vip-neon">SECURITY CHECKPOINT</h1>
-                <p class="text-[11px] text-gray-500 uppercase tracking-widest mt-1">OPERATOR ENCRYPTED GATEWAY SIGNATURE PERIMETER</p>
+                <p class="text-[11px] text-gray-500 uppercase tracking-widest mt-1">OPERATOR SYSTEM ACCESS ENTRY VALIDATION KEY REQUIRED</p>
             </div>
             <div class="space-y-4">
                 <div>
-                    <label class="block text-xs font-bold text-purple-400 uppercase mb-1">Enter Master Key or Token Profile</label>
+                    <label class="block text-xs font-bold text-purple-400 uppercase mb-1">Passcode / Key Token Structure</label>
                     <input type="password" id="gateway-security-key" class="w-full crypto-input rounded-xl px-4 py-3 text-xs tracking-widest text-center" placeholder="matrix_key_... or nirobxuptime_...">
                 </div>
-                <button onclick="attemptPerimeterAuthentication()" class="w-full bg-purple-600 hover:bg-purple-500 text-black font-black py-3 rounded-xl tracking-widest uppercase text-xs font-vip transition-all shadow-lg">VERIFY SCHEMATIC IDENTITY</button>
+                <button onclick="attemptPerimeterAuthentication()" class="w-full bg-purple-600 hover:bg-purple-500 text-black font-black py-3 rounded-xl tracking-widest uppercase text-xs font-vip transition-all shadow-lg">VERIFY INFRASTRUCTURE CORE</button>
             </div>
         </div>
 
-        <!-- PRINCIPAL WORKSPACE LOGISTICS MATRIX LAYOUT CONTAINER -->
         <div id="mainframe-application-workspace" class="w-full max-w-6xl mx-auto space-y-6 hidden my-6">
             <header class="vip-panel p-6 rounded-2xl flex flex-col md:flex-row justify-between items-center gap-4 border-l-4 border-l-purple-500">
                 <div>
-                    <h1 class="text-3xl font-black font-vip text-white tracking-widest text-vip-neon">VIP INTEGRATED SECURITY MATRIX</h1>
-                    <p class="text-xs text-gray-500 tracking-wider">SECURED CONTROLS ARCHITECTURE • POWERED BY SPEED_X</p>
+                    <h1 class="text-3xl font-black font-vip text-white tracking-widest text-vip-neon">VIP CENTRAL MANAGEMENT STORAGE SERVER</h1>
+                    <p class="text-xs text-gray-500 tracking-wider">SECURED ENGINE INTERFACES • DEVELOPED BY SPEED_X</p>
                 </div>
                 <div class="flex items-center gap-3">
                     <span id="role-badge" class="px-4 py-1.5 bg-purple-950/40 border border-purple-500/40 text-purple-300 font-black text-xs uppercase tracking-widest rounded-lg">SUBADMIN CONSOLE ACTIVE</span>
-                    <button onclick="destroyLocalSession()" class="px-3 py-1.5 bg-rose-950/40 border border-rose-900/50 hover:border-rose-500 text-rose-400 font-bold text-xs rounded-lg transition-all">TERMINATE ACCESS</button>
+                    <button onclick="window.location.reload()" class="px-3 py-1.5 bg-rose-950/40 border border-rose-900/50 hover:border-rose-500 text-rose-400 font-bold text-xs rounded-lg transition-all">TERMINATE ACCESS</button>
                 </div>
             </header>
 
-            <!-- OWNER PANELS STORAGE CONFIG BOX EXTENSIONS -->
             <div id="owner-exclusive-operations-box" class="hidden vip-panel p-6 rounded-2xl border border-dashed border-purple-500/40 space-y-4">
-                <h2 class="text-xs font-bold text-purple-400 font-vip uppercase tracking-widest"><i class="fa-solid fa-triangle-exclamation mr-1.5"></i> Live Core Infrastructure Maintenance Console Engine</h2>
+                <h2 class="text-xs font-bold text-purple-400 font-vip uppercase tracking-widest"><i class="fa-solid fa-triangle-exclamation mr-1.5"></i> Hot Database Engine Registry Overwrite Realtime Interface System</h2>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div class="bg-black/40 border border-purple-950 p-4 rounded-xl">
-                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Overwrite/Restore Remote Active JSON Database Structure</h3>
+                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Hot Swap Central Json Registry File</h3>
                         <input type="file" id="db-file-picker" accept=".json" class="block w-full text-xs text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-bold file:bg-purple-950 file:text-purple-400 cursor-pointer">
-                        <button onclick="commitDatabaseOverrideUpload()" class="mt-3 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-black text-xs font-black rounded-lg uppercase tracking-wider transition-all">EXECUTE FULL SYNC HOT-REPLACE</button>
+                        <button onclick="commitDatabaseOverrideUpload()" class="mt-3 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-black text-xs font-black rounded-lg uppercase tracking-wider transition-all">EXECUTE FULL HOT OVERWRITE</button>
                     </div>
                     <div class="bg-black/40 border border-purple-950 p-4 rounded-xl flex flex-col justify-between">
-                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Dump/Extract Remote Database Matrix Snapshot</h3>
-                        <p class="text-[11px] text-gray-500">Extract an instantaneous exact state cryptographic configuration of all active nodes, monitors, profiles, and tickets inside the mainframe database storage layer.</p>
-                        <button onclick="triggerDatabaseExportDownload()" class="mt-2 px-4 py-2 border border-purple-500 text-purple-400 hover:bg-purple-950 text-xs font-bold rounded-lg uppercase tracking-wider transition-all">EXTRACT SNAPSHOT BACKUP</button>
+                        <h3 class="text-xs font-bold text-white mb-2 uppercase">Dump/Extract Realtime Live Backup</h3>
+                        <p class="text-[11px] text-gray-500">Extract an instantaneous exact state cryptographic configuration of all active nodes inside the mainframe database storage layer.</p>
+                        <button onclick="triggerDatabaseExportDownload()" class="mt-2 px-4 py-2 border border-purple-500 text-purple-400 hover:bg-purple-950 text-xs font-bold rounded-lg uppercase tracking-wider transition-all">EXTRACT BACKUP STREAM DUMP</button>
                     </div>
                 </div>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <!-- Injection Panel Card -->
                 <div class="vip-panel p-6 rounded-2xl space-y-4 h-fit">
                     <h2 class="text-xs font-bold text-white font-vip uppercase tracking-widest flex items-center gap-1.5 text-vip-neon"><i class="fa-solid fa-circle-plus text-purple-400"></i> Inject Operational Vector Target</h2>
                     <div class="space-y-3 text-xs">
                         <div>
-                            <label class="block text-gray-400 mb-1 font-bold uppercase">Alias / Name</label>
-                            <input type="text" id="target-name" class="w-full crypto-input rounded-lg p-2.5" placeholder="VIP Target API Host">
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Alias Tag</label>
+                            <input type="text" id="target-name" class="w-full crypto-input rounded-lg p-2.5" placeholder="VIP System Channel">
                         </div>
                         <div>
-                            <label class="block text-gray-400 mb-1 font-bold uppercase">Routing URL / Connection Destination</label>
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Routing URL Destination</label>
                             <input type="url" id="target-url" class="w-full crypto-input rounded-lg p-2.5" placeholder="https://host.com/health">
                         </div>
                         <div>
-                            <label class="block text-gray-400 mb-1 font-bold uppercase">Polling Cycle Schedule Duration</label>
+                            <label class="block text-gray-400 mb-1 font-bold uppercase">Polling Cycle Frequency</label>
                             <select id="target-interval" class="w-full crypto-input rounded-lg p-2.5 cursor-pointer">
-                                <option value="1">1 Minute Sequence Hyper-Pulse</option>
-                                <option value="5" selected>5 Minutes Standard Premium Sequence</option>
-                                <option value="15">15 Minutes Conservative Allocation Mode</option>
+                                <option value="1">1 Minute Hyper Polling Pulse</option>
+                                <option value="5" selected>5 Minutes Standard Polling Logic</option>
+                                <option value="15">15 Minutes Conservative Mode</option>
                             </select>
                         </div>
-                        <button onclick="injectTargetNodePipeline()" class="w-full py-3 bg-purple-600 hover:bg-purple-500 text-black font-black uppercase tracking-wider rounded-xl font-vip transition-all">DEPLOY ENDPOINT PIPELINE</button>
+                        <button onclick="injectTargetNodePipeline()" class="w-full py-3 bg-purple-600 hover:bg-purple-500 text-black font-black uppercase tracking-wider rounded-xl font-vip transition-all">DEPLOY MONITOR NODE</button>
                     </div>
                 </div>
 
-                <!-- Live Monitoring Dynamic Streams Grid Panel Layout -->
                 <div class="lg:col-span-2 vip-panel p-6 rounded-2xl space-y-4">
-                    <h2 class="text-xs font-bold text-white font-vip uppercase tracking-widest flex items-center gap-1.5 text-vip-neon"><i class="fa-solid fa-network-wired text-purple-400"></i> LIVE DESIGNATED NETWORK CHANNELS TARGET TRACKS GRID</h2>
+                    <h2 class="text-xs font-bold text-white font-vip uppercase tracking-widest flex items-center gap-1.5 text-vip-neon"><i class="fa-solid fa-network-wired text-purple-400"></i> DYNAMIC TARGET CHANNELS MONITOR STRATIFIED GRID</h2>
                     <div id="channels-grid-container" class="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-[500px] overflow-y-auto pr-2"></div>
                 </div>
             </div>
@@ -583,7 +623,7 @@ async def deliver_nextgen_ui():
 
             async function attemptPerimeterAuthentication() {
                 const key = document.getElementById("gateway-security-key").value.trim();
-                if(!key) return alert("Access Key Required.");
+                if(!key) return alert("Access Entry Key Signature Required.");
                 const devId = fetchHardwareNodeSignature();
                 try {
                     const res = await fetch("/api/auth/verify", {
@@ -591,7 +631,7 @@ async def deliver_nextgen_ui():
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ key: key, device_id: devId })
                     });
-                    if(!res.ok) { const err = await res.json(); alert(err.detail || "Authentication Refused."); return; }
+                    if(!res.ok) { const err = await res.json(); alert(err.detail || "Access Key Refused by Firewall."); return; }
                     
                     const data = await res.json();
                     sessionState.token = data.token;
@@ -599,16 +639,15 @@ async def deliver_nextgen_ui():
                     sessionState.user_id = data.user_id;
 
                     document.getElementById("auth-wall-container").classList.add("hidden");
-                    const appWorkspace = document.getElementById("mainframe-application-workspace");
-                    appWorkspace.classList.remove("hidden");
+                    document.getElementById("mainframe-application-workspace").classList.remove("hidden");
                     
-                    document.getElementById("role-badge").innerText = `${data.role.toUpperCase()} CORE ACCESS`;
+                    document.getElementById("role-badge").innerText = `${data.role.toUpperCase()} LEVEL PERMISSION`;
                     if(data.role === "owner") {
                         document.getElementById("owner-exclusive-operations-box").classList.remove("hidden");
                     }
                     synchronizeChannelsGrid();
-                    setInterval(synchronizeChannelsGrid, 10000);
-                } catch(e) { alert("Matrix Core Connection Exception Refused System Network Entry."); }
+                    setInterval(synchronizeChannelsGrid, 8000);
+                } catch(e) { alert("Matrix Registry Denied System Endpoint Connection Thread."); }
             }
 
             async function synchronizeChannelsGrid() {
@@ -616,24 +655,24 @@ async def deliver_nextgen_ui():
                     const res = await fetch(`/api/monitors?user_id=${sessionState.user_id}&role=${sessionState.role}`);
                     const data = await res.json();
                     const container = document.getElementById("channels-grid-container");
-                    container.innerHTML = data.length === 0 ? '<div class="text-xs text-gray-600 col-span-2 text-center p-12 tracking-widest">NO SIGNALS ROUTED TO CURRENT MATRIX PIPELINE.</div>' : '';
+                    container.innerHTML = data.length === 0 ? '<div class="text-xs text-gray-600 col-span-2 text-center p-12 tracking-widest">NO SIGNALS ROUTED TO DYNAMIC DATA LAYER.</div>' : '';
                     
                     data.forEach(m => {
                         const div = document.createElement("div");
                         let isUp = m.status === 'UP';
                         let borderStyle = isUp ? 'border-l-emerald-500 vip-glow-glow' : m.status === 'DOWN' ? 'border-l-rose-500' : 'border-l-gray-600';
-                        div.className = `vip-panel p-4 rounded-xl border-l-4 ${borderStyle} text-xs space-y-2 transition-all`;
+                        div.className = `vip-panel p-4 rounded-xl border-l-4 ${borderStyle} text-xs space-y-2`;
                         div.innerHTML = `
                             <div class="flex justify-between items-start">
                                 <div>
-                                    <h4 class="font-bold text-white tracking-wide uppercase">${m.name} <span class="text-purple-500 font-mono">[${m.status_code}]</span></h4>
-                                    <p class="text-[11px] text-purple-400/60 break-all select-all mt-0.5">${m.url}</p>
+                                    <h4 class="font-bold text-white tracking-wide uppercase">${m.name} <span class="text-purple-400 font-mono">[${m.status_code}]</span></h4>
+                                    <p class="text-[11px] text-gray-500 break-all mt-0.5">${m.url}</p>
                                 </div>
                                 <span class="px-2 py-0.5 text-[9px] font-black tracking-widest rounded border ${isUp ? 'bg-emerald-950/40 text-emerald-400 border-emerald-500/20' : 'bg-rose-950/40 text-rose-400 border-rose-500/20'}">${m.status}</span>
                             </div>
                             <div class="grid grid-cols-2 gap-2 bg-black/40 border border-purple-950/30 p-2 rounded text-[11px] text-gray-400">
                                 <div>Latency: <span class="text-purple-400 font-bold">${m.response_time}ms</span></div>
-                                <div>Health Metrics: <span class="text-white font-bold">${m.uptime}%</span></div>
+                                <div>Uptime Score: <span class="text-white font-bold">${m.uptime}%</span></div>
                             </div>
                             <div class="flex gap-2 pt-1">
                                 <button onclick="executeNodeToggle('${m.id}')" class="px-3 py-1 bg-purple-950/40 border border-purple-900 text-purple-300 rounded hover:border-purple-500 transition-all">${m.is_active ? 'Suspend' : 'Activate'}</button>
@@ -649,7 +688,7 @@ async def deliver_nextgen_ui():
                 const name = document.getElementById("target-name").value.trim();
                 const url = document.getElementById("target-url").value.trim();
                 const interval = document.getElementById("target-interval").value;
-                if(!name || !url) return alert("All profile properties must be specified prior to pipeline initialization.");
+                if(!name || !url) return alert("Properties fields mandatory matrix allocation profiles requirements.");
                 
                 const res = await fetch("/api/monitors", {
                     method: "POST",
@@ -660,7 +699,7 @@ async def deliver_nextgen_ui():
                     document.getElementById("target-name").value = "";
                     document.getElementById("target-url").value = "";
                     synchronizeChannelsGrid();
-                } else { const err = await res.json(); alert(err.detail || "Injection Refused."); }
+                } else { const err = await res.json(); alert(err.detail || "Allocation injection denied."); }
             }
 
             async function executeNodeToggle(mid) {
@@ -673,25 +712,15 @@ async def deliver_nextgen_ui():
             }
 
             async function executeNodeIsolationTermination(mid) {
-                if(confirm("Are you sure you want to terminate this endpoint channel sequence?")) {
+                if(confirm("Terminate object channel connection pathway asset?")) {
                     await fetch(`/api/monitors/${mid}?user_id=${sessionState.user_id}&role=${sessionState.role}`, { method: "DELETE" });
                     synchronizeChannelsGrid();
                 }
             }
 
-            function destroyLocalSession() { window.location.reload(); }
-
-            async function triggerDatabaseExportDownload() {
-                const res = await fetch(`/api/monitors?user_id=${sessionState.user_id}&role=${sessionState.role}`);
-                const monitorsList = await res.json();
-                const blob = new Blob([JSON.stringify({users: {}, monitors: monitorsList, redeem_codes: {}, web_keys: []}, null, 4)], {type : 'application/json'});
-                const anchor = document.createElement('a'); anchor.href = URL.createObjectURL(blob);
-                anchor.download = "matrix_snapshot_backup.json"; anchor.click(); anchor.remove();
-            }
-
             function commitDatabaseOverrideUpload() {
                 const filePicker = document.getElementById("db-file-picker");
-                if(filePicker.files.length === 0) return alert("Select a template JSON structural matrix configuration payload asset array first.");
+                if(filePicker.files.length === 0) return alert("Select standard source .json asset file cluster pool first.");
                 const fileReader = new FileReader();
                 fileReader.onload = async function(e) {
                     try {
@@ -699,13 +728,20 @@ async def deliver_nextgen_ui():
                         const res = await fetch("/api/system/upload_db", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ role: sessionState.role, token: sessionState.token, database_json: dataObj })
+                            body: JSON.stringify({ role: sessionState.role, database_json: dataObj })
                         });
-                        if(res.ok) { alert("Core Database registries completely replaced and synchronized successfully."); synchronizeChannelsGrid(); }
-                        else { alert("Internal Error executing file replacement override layer mapping pipeline."); }
-                    } catch(err) { alert("JSON structural framing error compilation syntax failure analysis rejected."); }
+                        if(res.ok) { alert("Core registries database structure completely hot-replaced."); synchronizeChannelsGrid(); }
+                    } catch(err) { alert("Syntax architecture framing error asset compile rejection analysis."); }
                 };
                 fileReader.readAsText(filePicker.files[0]);
+            }
+
+            async function triggerDatabaseExportDownload() {
+                const res = await fetch(`/api/monitors?user_id=${sessionState.user_id}&role=${sessionState.role}`);
+                const list = await res.json();
+                const blob = new Blob([JSON.stringify({users: {}, monitors: list, redeem_codes: {}, web_keys: []}, null, 4)], {type : 'application/json'});
+                const anchor = document.createElement('a'); anchor.href = URL.createObjectURL(blob);
+                anchor.download = "matrix_hot_backup.json"; anchor.click(); anchor.remove();
             }
         </script>
     </body>
