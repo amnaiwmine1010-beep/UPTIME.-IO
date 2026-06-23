@@ -24,8 +24,8 @@ from contextlib import asynccontextmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-BOT_TOKEN = "7938490659:AAEdla7crncXJY0XDVWwUA8P8umOOdqHLC0"
-OWNER_ID = 123456789  # Replace with your actual Telegram User ID
+BOT_TOKEN = "8853802336:AAE1_izH6uR7H-sWrr7jnMd06eP5MHL2x54"
+OWNER_ID = 7224513731  # Replace with your actual Telegram User ID
 
 DB_FILE = "matrix_database.json"
 
