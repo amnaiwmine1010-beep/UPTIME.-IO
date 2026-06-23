@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
-BOT_TOKEN = "8853802336:AAE1_izH6uR7H-sWrr7jnMd06eP5MHL2x54"
+BOT_TOKEN = "8853802336:AAH0nWjUSvB7wBOeBsSuwMURBQdRQk4vznU"
 OWNER_ID = 7224513731
 DB_FILE = "matrix_database.json"
 
